@@ -1,0 +1,33 @@
+box fts scft
+Dim 2
+grid 35 35
+boxLengths 1.609475 1.609475
+species A
+species B
+species NP
+Nr 40
+C 1.5
+
+# molecule keyword, molecule type, vol fraction number of blocks, block N, block type, block N, block type...
+molecule linear activity 1.0 1 40 A 
+molecule linear activity 1.1 1 40 B
+molecule HParticle nmolecs 1 NP file NPlistnewdataX4
+
+
+potential incompress 0.025 updateScheme EMPC initialize value 0.0 0.0
+# potential particle A NP 3.0
+
+potential Flory A B 3.65 0.025 0.01 initialize value -0.5 0.0  updateScheme EMPC
+
+tolerance phi 1.0E-5
+logFreq 250
+chemFieldFreq 1000
+densityFieldFreq 1000
+endBox
+
+run vt 45001
+
+modify molecule 2 activity value 0.914
+
+run findspinodal nSteps 25001 initial_f 0.998 molecule 2
+
