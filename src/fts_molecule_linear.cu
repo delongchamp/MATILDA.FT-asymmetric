@@ -10,7 +10,9 @@
 #include <thrust/copy.h>
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <chrono>
 #include <cstdlib>
+#include <stdexcept>
 #include <string_view>
 #include "FTS_Box.h"
 #include "fts_species.h"
@@ -23,7 +25,92 @@ bool optionEnabled(const char* name) {
 }
 }
 
-LinearMolec::~LinearMolec(){}
+namespace {
+using Complex = thrust::complex<double>;
+
+void requireCuda(cudaError_t result) {
+    if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+}
+
+void requireFft(cufftResult result) {
+    if (result != CUFFT_SUCCESS) {
+        throw std::runtime_error("Stream bond cuFFT failure " + std::to_string(result));
+    }
+}
+
+__global__ void bondBlockWeight(const Complex* field, Complex* weights, Complex* first, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const Complex w = exp(-field[i]);
+    weights[i] = w;
+    if (first) first[i] = w;
+}
+
+__global__ void bondMultiply(const Complex* lhs, const Complex* rhs, Complex* out, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = lhs[i] * rhs[i];
+}
+}
+
+struct StreamBondPlan {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t ready = nullptr;
+    cudaEvent_t complete = nullptr;
+    cufftHandle fft = 0;
+    size_t workspaceBytes = 0;
+
+    explicit StreamBondPlan(FTS_Box& box) {
+        try {
+            requireCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+            requireCuda(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+            requireCuda(cudaEventCreateWithFlags(&complete, cudaEventDisableTiming));
+            requireFft(cufftCreate(&fft));
+            if (box.returnDimension() == 2) {
+                requireFft(cufftMakePlan2d(fft, box.Nx[1], box.Nx[0], CUFFT_Z2Z, &workspaceBytes));
+            } else {
+                requireFft(cufftMakePlan3d(fft, box.Nx[2], box.Nx[1], box.Nx[0], CUFFT_Z2Z, &workspaceBytes));
+            }
+            requireFft(cufftSetStream(fft, stream));
+            std::cout << "Stream bond cuFFT workspace bytes " << workspaceBytes << std::endl;
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+
+    ~StreamBondPlan() { release(); }
+
+    void release() {
+        if (stream) cudaStreamSynchronize(stream);
+        if (fft) cufftDestroy(fft);
+        if (ready) cudaEventDestroy(ready);
+        if (complete) cudaEventDestroy(complete);
+        if (stream) cudaStreamDestroy(stream);
+    }
+
+    void enqueueZ2Z(Complex* input, Complex* output, int direction) const {
+        requireFft(cufftExecZ2Z(fft, reinterpret_cast<cufftDoubleComplex*>(input),
+            reinterpret_cast<cufftDoubleComplex*>(output), direction));
+    }
+};
+
+struct StreamBondExecution {
+    std::shared_ptr<StreamBondPlan> plan;
+    const bool capture;
+    bool warmed = false;
+    bool captureFailed = false;
+    cudaGraphExec_t graph = nullptr;
+    std::vector<const Complex*> capturedFields;
+    Complex* capturedForward = nullptr;
+    const Complex* capturedReverse = nullptr;
+
+    explicit StreamBondExecution(bool useGraph) : capture(useGraph) {}
+    ~StreamBondExecution() {
+        if (graph) cudaGraphExecDestroy(graph);
+    }
+};
+
+LinearMolec::~LinearMolec() = default;
 
 LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
     : FTS_Molec(iss, p_box),
@@ -141,6 +228,15 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
     a.resize(mybox->M);
     expW.resize(mybox->M);
     fuseDensity = !doSmear && optionEnabled("SCFT_MATILDA_FUSE_DENSITY");
+    const char* streamMode = std::getenv("SCFT_MATILDA_BOND_GRAPH");
+    const int dimensions = mybox->returnDimension();
+    if (!doSmear && directBond && foldBondScale && Ntot > 0 && streamMode
+        && (dimensions == 2 || dimensions == 3)) {
+        const std::string_view mode(streamMode);
+        if (mode == "1" || mode == "2") {
+            streamBond = std::make_unique<StreamBondExecution>(mode == "2");
+        }
+    }
     if (!fuseDensity) {
         q_qdag.resize(mybox->M);
         temp.resize(mybox->M);
@@ -181,7 +277,114 @@ void LinearMolec::propagateBondStep(thrust::device_ptr<const thrust::complex<dou
                       thrust::multiplies<thrust::complex<double>>());
 }
 
+void LinearMolec::enqueueStreamSweeps() {
+    const auto& plan = *streamBond->plan;
+    const auto stream = plan.stream;
+    const int count = mybox->M;
+    constexpr int threads = 256;
+    const int grid = (count + threads - 1) / threads;
+    auto* weights = thrust::raw_pointer_cast(expW.data());
+    auto* frequency = thrust::raw_pointer_cast(a.data());
+    auto* product = thrust::raw_pointer_cast(hf.data());
+    const auto* symbol = thrust::raw_pointer_cast(d_bond_fft.data());
+    auto* forward = thrust::raw_pointer_cast(d_q.data());
+    auto* reverse = thrust::raw_pointer_cast(d_qdag.data());
+    const auto sweep = [&](Complex* history, bool backwards) {
+        size_t site = 0;
+        for (int i = 0; i < numBlocks; ++i) {
+            const int block = backwards ? numBlocks - 1 - i : i;
+            if (!N[block]) continue;
+            const auto* field = thrust::raw_pointer_cast(mybox->Species[intSpecies[block]].d_w.data());
+            bondBlockWeight<<<grid, threads, 0, stream>>>(field, weights, site == 0 ? history : nullptr, count);
+            for (int j = 0; j < N[block]; ++j, ++site) {
+                if (site == 0) continue;
+                auto* next = history + site * count;
+                plan.enqueueZ2Z(next - count, frequency, CUFFT_FORWARD);
+                bondMultiply<<<grid, threads, 0, stream>>>(symbol, frequency, product, count);
+                plan.enqueueZ2Z(product, next, CUFFT_INVERSE);
+                bondMultiply<<<grid, threads, 0, stream>>>(next, weights, next, count);
+            }
+        }
+    };
+    sweep(forward, false);
+    if (!isSymmetric) sweep(reverse, true);
+    else if (!shareReverse) {
+        requireCuda(cudaMemcpyAsync(reverse, forward, d_q.size() * sizeof(Complex),
+                                     cudaMemcpyDeviceToDevice, stream));
+    }
+    requireCuda(cudaPeekAtLastError());
+}
+
+void LinearMolec::submitStreamPropagators() {
+    auto& execution = *streamBond;
+    if (!execution.plan) {
+        execution.plan = mybox->streamBondPlan.lock();
+        if (!execution.plan) {
+            execution.plan = std::make_shared<StreamBondPlan>(*mybox);
+            mybox->streamBondPlan = execution.plan;
+        }
+    }
+    const auto& plan = *execution.plan;
+    requireCuda(cudaEventRecord(plan.ready, nullptr));
+    requireCuda(cudaStreamWaitEvent(plan.stream, plan.ready));
+
+    if (execution.capture && !execution.captureFailed && execution.warmed) {
+        bool same = execution.graph
+            && execution.capturedForward == thrust::raw_pointer_cast(d_q.data())
+            && execution.capturedReverse == thrust::raw_pointer_cast(reverseHistory());
+        for (int b = 0; same && b < numBlocks; ++b) {
+            const auto* field = thrust::raw_pointer_cast(mybox->Species[intSpecies[b]].d_w.data());
+            same = execution.capturedFields[b] == field;
+        }
+        if (!same) {
+            if (execution.graph) requireCuda(cudaGraphExecDestroy(execution.graph));
+            execution.graph = nullptr;
+            const auto start = std::chrono::steady_clock::now();
+            auto status = cudaStreamBeginCapture(plan.stream, cudaStreamCaptureModeThreadLocal);
+            cudaGraph_t captured = nullptr;
+            if (status == cudaSuccess) {
+                try {
+                    enqueueStreamSweeps();
+                } catch (const std::runtime_error&) {
+                    status = cudaErrorStreamCaptureInvalidated;
+                }
+                const auto ended = cudaStreamEndCapture(plan.stream, &captured);
+                if (status == cudaSuccess) status = ended;
+            }
+            if (status == cudaSuccess) {
+                status = cudaGraphInstantiate(&execution.graph, captured, 0);
+            }
+            if (captured) requireCuda(cudaGraphDestroy(captured));
+            if (status == cudaSuccess) {
+                execution.capturedForward = thrust::raw_pointer_cast(d_q.data());
+                execution.capturedReverse = thrust::raw_pointer_cast(reverseHistory());
+                execution.capturedFields.clear();
+                for (int species : intSpecies) {
+                    execution.capturedFields.push_back(thrust::raw_pointer_cast(mybox->Species[species].d_w.data()));
+                }
+                const auto buildUs = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - start).count();
+                std::cout << "Bond graph instantiated for molecule " << blockSpecies[0]
+                          << ", build us " << buildUs << std::endl;
+            } else {
+                execution.captureFailed = true;
+                std::cout << "Bond graph capture unavailable, using eager stream: "
+                          << cudaGetErrorString(status) << std::endl;
+                (void)cudaGetLastError();
+            }
+        }
+    }
+    if (execution.graph) requireCuda(cudaGraphLaunch(execution.graph, plan.stream));
+    else enqueueStreamSweeps();
+    execution.warmed = true;
+    requireCuda(cudaEventRecord(plan.complete, plan.stream));
+    requireCuda(cudaStreamWaitEvent(nullptr, plan.complete));
+}
+
 void LinearMolec::calcPropagators() {
+    if (streamBond) {
+        submitStreamPropagators();
+    } else {
     
 
     //////////////////////////////////
@@ -270,6 +473,8 @@ void LinearMolec::calcPropagators() {
         }// b=0:numBlocks
     }// Calculating complimentary propagator
 
+
+    }
 
     // Calculate the partition function
     this->Q = thrust::reduce(d_q.begin()+(Ntot-1)*mybox->M, d_q.begin()+Ntot*mybox->M, thrust::complex<double>(0.0), 

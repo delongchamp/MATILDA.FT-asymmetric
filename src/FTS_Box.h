@@ -8,10 +8,12 @@
 #include "Box.h"
 #include <cufft.h>
 #include <cufftXt.h>
+#include <memory>
 
 class FTS_Species;
 class FTS_Molec;
 class FTS_Potential;
+struct StreamBondPlan;
 
 class FTS_Box : public Box {
     protected:
@@ -40,6 +42,7 @@ class FTS_Box : public Box {
 
         cuDoubleComplex *d_cpxGabe, *d_cpxAtmn; // [M] temp storage for device complex arrays
         
+        std::weak_ptr<StreamBondPlan> streamBondPlan;
         std::vector<FTS_Species> Species;       // Contains the density of each species
         std::vector<FTS_Molec*> Molecs;         // Calculates properties of each species
         std::vector<FTS_Potential*> Potentials; // Stores and updates potentials

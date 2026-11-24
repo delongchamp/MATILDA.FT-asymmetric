@@ -10,8 +10,10 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <thrust/complex.h>
+#include <memory>
 
 class FTS_Box;
+struct StreamBondExecution;
 
 class LinearMolec : public FTS_Molec {
     private:
@@ -22,6 +24,9 @@ class LinearMolec : public FTS_Molec {
         bool fuseDensity = false;
         thrust::device_vector<thrust::complex<double>> d_qdag;
 
+        std::unique_ptr<StreamBondExecution> streamBond;
+        void submitStreamPropagators();
+        void enqueueStreamSweeps();
         void propagateBondStep(thrust::device_ptr<const thrust::complex<double>> previous,
                                thrust::device_ptr<thrust::complex<double>> next);
 
