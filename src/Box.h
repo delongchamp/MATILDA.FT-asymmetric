@@ -41,7 +41,7 @@ class Box {
         int blockSize;                      // GPU block size
 
         cufftHandle fftplan, fftplanSingle; // FFT Plans
-        void cufftWrapperDouble(thrust::device_vector<thrust::complex<double>>,
+        void cufftWrapperDouble(const thrust::device_vector<thrust::complex<double>>&,
             thrust::device_vector<thrust::complex<double>>&, const int);
         void convolveTComplexDouble(thrust::device_vector<thrust::complex<double>>,
             thrust::device_vector<thrust::complex<double>>&, thrust::device_vector<thrust::complex<double>>);

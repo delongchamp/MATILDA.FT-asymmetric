@@ -71,30 +71,44 @@ void Box::convolveTComplexDouble(
 
 }
 
+namespace {
+struct NormalizeComplexFFT {
+    thrust::complex<double> factor;
+
+    __host__ __device__ thrust::complex<double> operator()(
+        const thrust::complex<double>& value) const {
+        return value * factor;
+    }
+};
+}
+
 void Box::cufftWrapperDouble(
-    thrust::device_vector<thrust::complex<double>> in,
+    const thrust::device_vector<thrust::complex<double>>& in,
     thrust::device_vector<thrust::complex<double>> &out,
     const int fftDir)      // fftDir = 1 for forward, -1 for backwards FFT
     {
 
     int startTime = time(0);
 	
-    cuDoubleComplex* _in = (cuDoubleComplex*)thrust::raw_pointer_cast(in.data());
-    cuDoubleComplex* _out = (cuDoubleComplex*)thrust::raw_pointer_cast(out.data());
+    // cuFFT's complex-to-complex API accepts both out-of-place and in-place buffers.
+    // Its input argument is non-const even when the out-of-place transform preserves it.
+    const auto* input = thrust::raw_pointer_cast(in.data());
+    auto* _in = reinterpret_cast<cuDoubleComplex*>(
+        const_cast<thrust::complex<double>*>(input));
+    auto* _out = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(out.data()));
 
     if ( fftDir == 1 ) {
-        cufftExecZ2Z(fftplan, _in, _out, CUFFT_FORWARD);
-
-        // Normalize the FT
-        thrust::device_vector<thrust::complex<double>> norm(M);
-        thrust::fill(norm.begin(), norm.end(), 1.0/double(M));
-        
-        thrust::transform(out.begin(), out.end(), norm.begin(), out.begin(), 
-            thrust::multiplies<thrust::complex<double>>());
+        if (cufftExecZ2Z(fftplan, _in, _out, CUFFT_FORWARD) != CUFFT_SUCCESS) {
+            die("cuFFT forward double-complex transform failed");
+        }
+        thrust::transform(out.begin(), out.begin() + M, out.begin(),
+                          NormalizeComplexFFT{1.0 / double(M)});
     }
 
     else if ( fftDir == -1 ) {
-        cufftExecZ2Z(fftplan, _in, _out, CUFFT_INVERSE);        
+        if (cufftExecZ2Z(fftplan, _in, _out, CUFFT_INVERSE) != CUFFT_SUCCESS) {
+            die("cuFFT inverse double-complex transform failed");
+        }
     }
 
 

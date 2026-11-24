@@ -106,7 +106,7 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Molec(is
 
 
     // Initialize bond potential
-    thrust::device_vector<thrust::complex<double>> bond_fft(mybox->M);
+    thrust::host_vector<thrust::complex<double>> bond_fft(mybox->M);
 
     double k2, *kv;
     kv = new double[mybox->returnDimension()];
@@ -128,10 +128,8 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Molec(is
     hf.resize(mybox->M);
     a.resize(mybox->M);
     expW.resize(mybox->M);
-    norm.resize(mybox->M);
     q_qdag.resize(mybox->M);
     temp.resize(mybox->M);
-    thrust::fill(norm.begin(), norm.end(), 1.0/double(mybox->M));
 }
 
 struct NegExponential {

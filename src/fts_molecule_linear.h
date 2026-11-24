@@ -43,9 +43,6 @@ class LinearMolec : public FTS_Molec {
         thrust::device_vector<thrust::complex<double>> q_qdag;
         thrust::device_vector<thrust::complex<double>> temp;
 
-        // To normalize FTs
-        thrust::device_vector<thrust::complex<double>> norm;
-    
         
         ~LinearMolec();
         LinearMolec(std::istringstream& iss, FTS_Box*);
