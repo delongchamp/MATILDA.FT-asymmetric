@@ -5,6 +5,8 @@
 #include "FTS_Box.h"
 
 #include "fts_molecule.h"
+#include "fts_molecule_linear.h"
+#include <string_view>
 #include "fts_species.h"
 #include "fts_potential.h"
 #include "include_libs.h"
@@ -15,6 +17,27 @@
 void die(const char*);
 FTS_Molec* FTS_MolecFactory(std::istringstream&, FTS_Box*);
 FTS_Potential* FTS_PotentialFactory(std::istringstream&, FTS_Box*);
+
+void FTS_Box::calcMoleculeDensities() {
+    const auto enabled = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value && std::string_view(value) == "1";
+    };
+    const bool batch = enabled("SCFT_MATILDA_BOND_BATCH");
+    const bool streams = enabled("SCFT_MATILDA_BOND_STREAMS");
+    for (size_t i = 0; i < Molecs.size(); ++i) {
+        const auto start = time(0);
+        bool paired = false;
+        if ((batch || streams) && i + 1 < Molecs.size()) {
+            auto* first = dynamic_cast<LinearMolec*>(Molecs[i]);
+            auto* second = dynamic_cast<LinearMolec*>(Molecs[i + 1]);
+            paired = first && second && first->calcPairedDensity(*second, batch, streams);
+        }
+        if (paired) ++i;
+        else Molecs[i]->calcDensity();
+        moleculeTimer += time(0) - start;
+    }
+}
 
 // Executes the commands for a given time step
 // Updates all fields, then recomputes all molecule densities
@@ -43,11 +66,7 @@ void FTS_Box::doTimeStep(int step) {
     // std::cout << "species fields zeroed" << std::endl;
 
     // Recalculate all density fields, including populating species densities
-    for ( int i=0 ; i<Molecs.size(); i++ ) {
-        int ti = time(0);
-        Molecs[i]->calcDensity();
-        moleculeTimer += time(0) - ti;
-    }
+    calcMoleculeDensities();
 
     // std::cout << "densities calculated" << std::endl;
 
@@ -70,11 +89,7 @@ void FTS_Box::doTimeStep(int step) {
         }
 
         // Recalculate all density fields, including populating species densities
-        for ( int i=0 ; i<Molecs.size(); i++ ) {
-            int ti = time(0);
-            Molecs[i]->calcDensity();
-            moleculeTimer += time(0) - ti;
-        }        
+        calcMoleculeDensities();
     }
 
     // std::cout << "PC steps finished" << std::endl;

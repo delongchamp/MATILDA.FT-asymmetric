@@ -59,13 +59,19 @@ struct StreamBondPlan {
     cufftHandle fft = 0;
     size_t workspaceBytes = 0;
 
-    explicit StreamBondPlan(FTS_Box& box) {
+    explicit StreamBondPlan(FTS_Box& box, int batch = 1) {
         try {
             requireCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
             requireCuda(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
             requireCuda(cudaEventCreateWithFlags(&complete, cudaEventDisableTiming));
             requireFft(cufftCreate(&fft));
-            if (box.returnDimension() == 2) {
+            if (batch == 2) {
+                const int dim = box.returnDimension();
+                int lengths[3];
+                for (int j = 0; j < dim; ++j) lengths[j] = box.Nx[dim - 1 - j];
+                requireFft(cufftMakePlanMany(fft, dim, lengths, lengths, 1, box.M,
+                    lengths, 1, box.M, CUFFT_Z2Z, batch, &workspaceBytes));
+            } else if (box.returnDimension() == 2) {
                 requireFft(cufftMakePlan2d(fft, box.Nx[1], box.Nx[0], CUFFT_Z2Z, &workspaceBytes));
             } else {
                 requireFft(cufftMakePlan3d(fft, box.Nx[2], box.Nx[1], box.Nx[0], CUFFT_Z2Z, &workspaceBytes));
@@ -98,6 +104,7 @@ struct StreamBondExecution {
     std::shared_ptr<StreamBondPlan> plan;
     const bool capture;
     bool warmed = false;
+    bool exclusive = false;
     bool captureFailed = false;
     cudaGraphExec_t graph = nullptr;
     std::vector<const Complex*> capturedFields;
@@ -108,6 +115,38 @@ struct StreamBondExecution {
     ~StreamBondExecution() {
         if (graph) cudaGraphExecDestroy(graph);
     }
+};
+
+namespace {
+__global__ void seedBatch(const Complex* first, const Complex* second,
+                          Complex* frontier, Complex* firstHistory, Complex* secondHistory, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    firstHistory[i] = frontier[i] = first[i];
+    secondHistory[i] = frontier[count + i] = second[i];
+}
+
+__global__ void scaleBatch(const Complex* symbol, Complex* spectrum, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    spectrum[i] = symbol[i] * spectrum[i];
+    spectrum[count + i] = symbol[i] * spectrum[count + i];
+}
+
+__global__ void finishBatch(const Complex* first, const Complex* second,
+                            Complex* frontier, Complex* firstHistory, Complex* secondHistory, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    firstHistory[i] = frontier[i] = frontier[i] * first[i];
+    secondHistory[i] = frontier[count + i] = frontier[count + i] * second[i];
+}
+}
+
+struct BatchedBondExecution {
+    StreamBondPlan plan;
+    thrust::device_vector<Complex> frontier, spectrum;
+    explicit BatchedBondExecution(FTS_Box& box)
+        : plan(box, 2), frontier(size_t(2) * box.M), spectrum(size_t(2) * box.M) {}
 };
 
 LinearMolec::~LinearMolec() = default;
@@ -315,13 +354,17 @@ void LinearMolec::enqueueStreamSweeps() {
     requireCuda(cudaPeekAtLastError());
 }
 
-void LinearMolec::submitStreamPropagators() {
+void LinearMolec::submitStreamPropagators(bool join, bool exclusive) {
     auto& execution = *streamBond;
-    if (!execution.plan) {
-        execution.plan = mybox->streamBondPlan.lock();
+    if (!execution.plan || (exclusive && !execution.exclusive)) {
+        if (execution.graph) requireCuda(cudaGraphExecDestroy(execution.graph));
+        execution.graph = nullptr;
+        execution.warmed = false;
+        execution.exclusive = exclusive;
+        execution.plan = exclusive ? nullptr : mybox->streamBondPlan.lock();
         if (!execution.plan) {
             execution.plan = std::make_shared<StreamBondPlan>(*mybox);
-            mybox->streamBondPlan = execution.plan;
+            if (!exclusive) mybox->streamBondPlan = execution.plan;
         }
     }
     const auto& plan = *execution.plan;
@@ -378,12 +421,111 @@ void LinearMolec::submitStreamPropagators() {
     else enqueueStreamSweeps();
     execution.warmed = true;
     requireCuda(cudaEventRecord(plan.complete, plan.stream));
-    requireCuda(cudaStreamWaitEvent(nullptr, plan.complete));
+    if (join) joinStreamPropagators();
+}
+
+void LinearMolec::joinStreamPropagators() {
+    requireCuda(cudaStreamWaitEvent(nullptr, streamBond->plan->complete));
+}
+
+void LinearMolec::enqueueBatchedSweeps(LinearMolec& other) {
+    const auto& bond = *batchedBond;
+    const auto& plan = bond.plan;
+    const auto stream = plan.stream;
+    const int count = mybox->M;
+    constexpr int threads = 256;
+    const int grid = (count + threads - 1) / threads;
+    auto* frontier = thrust::raw_pointer_cast(batchedBond->frontier.data());
+    auto* spectrum = thrust::raw_pointer_cast(batchedBond->spectrum.data());
+    auto* firstWeight = thrust::raw_pointer_cast(expW.data());
+    auto* secondWeight = thrust::raw_pointer_cast(other.expW.data());
+    const auto* symbol = thrust::raw_pointer_cast(d_bond_fft.data());
+
+    struct BlockCursor {
+        LinearMolec& chain;
+        int block, step, stop = 0;
+
+        void loadIfNeeded(int site, Complex* weight, int grid, int threads, int count, cudaStream_t stream) {
+            if (site != stop) return;
+            while (chain.N[block] == 0) block += step;
+            const auto* field = thrust::raw_pointer_cast(chain.mybox->Species[chain.intSpecies[block]].d_w.data());
+            bondBlockWeight<<<grid, threads, 0, stream>>>(field, weight, nullptr, count);
+            stop += chain.N[block];
+            block += step;
+        }
+    };
+    const auto sweep = [&](Complex* firstTape, Complex* secondTape, bool reverse) {
+        const int step = reverse ? -1 : 1;
+        BlockCursor first{*this, reverse ? numBlocks - 1 : 0, step};
+        BlockCursor second{other, reverse ? other.numBlocks - 1 : 0, step};
+        for (size_t site = 0; site < size_t(Ntot); ++site) {
+            first.loadIfNeeded(site, firstWeight, grid, threads, count, stream);
+            second.loadIfNeeded(site, secondWeight, grid, threads, count, stream);
+            if (site == 0) {
+                seedBatch<<<grid, threads, 0, stream>>>(firstWeight, secondWeight,
+                    frontier, firstTape, secondTape, count);
+                continue;
+            }
+            plan.enqueueZ2Z(frontier, spectrum, CUFFT_FORWARD);
+            scaleBatch<<<grid, threads, 0, stream>>>(symbol, spectrum, count);
+            plan.enqueueZ2Z(spectrum, frontier, CUFFT_INVERSE);
+            finishBatch<<<grid, threads, 0, stream>>>(firstWeight, secondWeight, frontier,
+                firstTape + site * count, secondTape + site * count, count);
+        }
+    };
+    sweep(thrust::raw_pointer_cast(d_q.data()), thrust::raw_pointer_cast(other.d_q.data()), false);
+    if (!isSymmetric) {
+        sweep(thrust::raw_pointer_cast(d_qdag.data()), thrust::raw_pointer_cast(other.d_qdag.data()), true);
+    } else {
+        for (auto* molecule : {this, &other}) {
+            if (!molecule->shareReverse) {
+                requireCuda(cudaMemcpyAsync(thrust::raw_pointer_cast(molecule->d_qdag.data()),
+                    thrust::raw_pointer_cast(molecule->d_q.data()), molecule->d_q.size() * sizeof(Complex),
+                    cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+    }
+    requireCuda(cudaPeekAtLastError());
+}
+
+bool LinearMolec::calcPairedDensity(LinearMolec& other, bool batch, bool streams) {
+    if (mybox != other.mybox || doSmear || other.doSmear || !directBond || !other.directBond
+        || !foldBondScale || !other.foldBondScale || Ntot <= 0 || other.Ntot <= 0) return false;
+    const int dim = mybox->returnDimension();
+    if (dim != 2 && dim != 3) return false;
+
+    if (batch && Ntot == other.Ntot && isSymmetric == other.isSymmetric) {
+        if (!batchedBond) {
+            batchedBond = std::make_unique<BatchedBondExecution>(*mybox);
+            std::cout << "Batch-two bond plan, " << 2 * mybox->M * sizeof(Complex) * 2
+                      << " frontier and spectrum bytes" << std::endl;
+        }
+        const auto& plan = batchedBond->plan;
+        requireCuda(cudaEventRecord(plan.ready, nullptr));
+        requireCuda(cudaStreamWaitEvent(plan.stream, plan.ready));
+        enqueueBatchedSweeps(other);
+        requireCuda(cudaEventRecord(plan.complete, plan.stream));
+        requireCuda(cudaStreamWaitEvent(nullptr, plan.complete));
+    } else if (streams) {
+        if (!streamBond) streamBond = std::make_unique<StreamBondExecution>(false);
+        if (!other.streamBond) other.streamBond = std::make_unique<StreamBondExecution>(false);
+        submitStreamPropagators(false, true);
+        other.submitStreamPropagators(false, true);
+        joinStreamPropagators();
+        other.joinStreamPropagators();
+    } else {
+        return false;
+    }
+    reducePartition();
+    contractDensity();
+    other.reducePartition();
+    other.contractDensity();
+    return true;
 }
 
 void LinearMolec::calcPropagators() {
     if (streamBond) {
-        submitStreamPropagators();
+        submitStreamPropagators(true, false);
     } else {
     
 
@@ -476,7 +618,10 @@ void LinearMolec::calcPropagators() {
 
     }
 
-    // Calculate the partition function
+    reducePartition();
+}
+
+void LinearMolec::reducePartition() {
     this->Q = thrust::reduce(d_q.begin()+(Ntot-1)*mybox->M, d_q.begin()+Ntot*mybox->M, thrust::complex<double>(0.0), 
                         thrust::plus<thrust::complex<double>>()) * mybox->gvol / mybox->V;
 
@@ -513,8 +658,10 @@ void LinearMolec::calcDensity() {
 
     // First, calculate the propagators
     calcPropagators();
+    contractDensity();
+}
 
-
+void LinearMolec::contractDensity() {
     int M = mybox->M;
     thrust::complex<double> factor;
     if ( nmolecs > 0.0 ) {

@@ -14,6 +14,7 @@
 
 class FTS_Box;
 struct StreamBondExecution;
+struct BatchedBondExecution;
 
 class LinearMolec : public FTS_Molec {
     private:
@@ -25,7 +26,12 @@ class LinearMolec : public FTS_Molec {
         thrust::device_vector<thrust::complex<double>> d_qdag;
 
         std::unique_ptr<StreamBondExecution> streamBond;
-        void submitStreamPropagators();
+        std::unique_ptr<BatchedBondExecution> batchedBond;
+        void submitStreamPropagators(bool join, bool exclusive);
+        void joinStreamPropagators();
+        void enqueueBatchedSweeps(LinearMolec& other);
+        void reducePartition();
+        void contractDensity();
         void enqueueStreamSweeps();
         void propagateBondStep(thrust::device_ptr<const thrust::complex<double>> previous,
                                thrust::device_ptr<thrust::complex<double>> next);
@@ -63,6 +69,7 @@ class LinearMolec : public FTS_Molec {
         thrust::device_ptr<const thrust::complex<double>> reverseHistory() const;
         void calcPropagators();
         void calcDensity() override;
+        bool calcPairedDensity(LinearMolec& other, bool batch, bool streams);
         std::complex<double> calcHTerm() override;
         void computeLinearTerms() override;
         void modifyMolecule(std::istringstream&) override;

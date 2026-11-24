@@ -53,6 +53,7 @@ class FTS_Box : public Box {
         std::string returnFTSstyle();
         void readInput(std::ifstream&);
         void doTimeStep(int);
+        void calcMoleculeDensities();
         void finishInitialization();
         void writeSpeciesDensityFields();
         void writeData(int) override;

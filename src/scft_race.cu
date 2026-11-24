@@ -234,7 +234,7 @@ void runFixed(FTS_Box& box, const BinaryModel& model, const Path& out) {
     readFrozenField(root / "w_ps.raw", a.d_w);
     readFrozenField(root / "w_pmma.raw", b.d_w);
     for (auto& species : box.Species) species.zeroDensity();
-    for (auto* molecule : box.Molecs) molecule->calcDensity();
+    box.calcMoleculeDensities();
     const double scale = 1.0 / (box.C * box.Nr);
     writeNpy(out / "phi_ps.npy", box, a.d_density, scale);
     writeNpy(out / "phi_pmma.npy", box, b.d_density, scale);
