@@ -27,6 +27,7 @@ class FTS_Box : public Box {
         double C;           // System concentration
         int chemFieldFreq;  // Frequency to write potential fields
         std::complex<double> Heff;  // Effective Hamiltonian
+        const int fieldAssembly;           // 0 legacy, 1 scalar, 2 aliases, 3 fused
         int PCflag;         // Flag for using predictor-corrector methods
         
 

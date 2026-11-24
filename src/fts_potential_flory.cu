@@ -46,6 +46,9 @@ PotentialFlory::PotentialFlory(std::istringstream& iss, FTS_Box* p_box) : FTS_Po
         die(LW);
     }
 
+    speciesI = itest;
+    speciesJ = jtest;
+
     iss >> chiN;
 
     // Set time steps for plus and minus fields
@@ -65,8 +68,10 @@ PotentialFlory::PotentialFlory(std::istringstream& iss, FTS_Box* p_box) : FTS_Po
     d_Akmi.resize(mybox->M, ivalue);
     wmiAlloc_flag = 1;
     
-    d_rhoI.resize(mybox->M, ivalue);
-    d_rhoJ.resize(mybox->M, ivalue);
+    if (mybox->fieldAssembly < 2) {
+        d_rhoI.resize(mybox->M, ivalue);
+        d_rhoJ.resize(mybox->M, ivalue);
+    }
     d_dHdwmi.resize(mybox->M, ivalue);
     d_dHdwpl.resize(mybox->M, ivalue);
 
@@ -115,27 +120,31 @@ PotentialFlory::PotentialFlory(std::istringstream& iss, FTS_Box* p_box) : FTS_Po
 // Updates potential fields using the chosen scheme
 // If two-part predictor/corrector scheme is to be used, then 
 // this step is the predictor step
+void PotentialFlory::computeForce() {
+    const auto* rhoI = &mybox->Species[speciesI].d_density;
+    const auto* rhoJ = &mybox->Species[speciesJ].d_density;
+    if (mybox->fieldAssembly < 2) {
+        d_rhoI = *rhoI;
+        d_rhoJ = *rhoJ;
+        rhoI = &d_rhoI;
+        rhoJ = &d_rhoJ;
+    }
+    const auto read = [](const auto& values) {
+        return reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(values.data()));
+    };
+    auto* plusForce = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdwpl.data()));
+    auto* minusForce = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdwmi.data()));
+    d_makeFloryForce<<<mybox->M_Grid, mybox->M_Block>>>(plusForce, minusForce,
+        read(d_wpl), read(d_wmi), read(*rhoI), read(*rhoJ), mybox->C, chiN, mybox->Nr, mybox->M);
+}
+
 void PotentialFlory::updateFields() {
 
-    // Assign species I and J
-    for ( int i=0 ; i<mybox->Species.size() ; i++ ) {
-        if ( actsOn[0] == mybox->Species[i].fts_species ) { d_rhoI = mybox->Species[i].d_density; }
-        else if ( actsOn[1] == mybox->Species[i].fts_species ) { d_rhoJ = mybox->Species[i].d_density; }
-    }
-
-    // Pointers to the thrust data
-    cuDoubleComplex* _d_dHdwpl = (cuDoubleComplex*)thrust::raw_pointer_cast(d_dHdwpl.data());
-    cuDoubleComplex* _d_dHdwmi = (cuDoubleComplex*)thrust::raw_pointer_cast(d_dHdwmi.data());
-    cuDoubleComplex* _d_rhoI = (cuDoubleComplex*)thrust::raw_pointer_cast(d_rhoI.data());
-    cuDoubleComplex* _d_rhoJ = (cuDoubleComplex*)thrust::raw_pointer_cast(d_rhoJ.data());
-    cuDoubleComplex* _d_wpl = (cuDoubleComplex*)thrust::raw_pointer_cast(d_wpl.data());
-    cuDoubleComplex* _d_wmi = (cuDoubleComplex*)thrust::raw_pointer_cast(d_wmi.data());
-
-
-    // Forces are generated in real space
-    d_makeFloryForce<<<mybox->M_Grid, mybox->M_Block>>>(_d_dHdwpl, _d_dHdwmi, _d_wpl,
-        _d_wmi, _d_rhoI, _d_rhoJ, mybox->C, chiN, mybox->Nr, mybox->M);
-
+    computeForce();
+    auto* _d_wpl = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_wpl.data()));
+    auto* _d_wmi = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_wmi.data()));
+    const auto* _d_dHdwpl = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdwpl.data()));
+    const auto* _d_dHdwmi = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdwmi.data()));
 
     // If doing predictor/corrector scheme
     if ( updateScheme == "EMPC" ) {
@@ -180,27 +189,15 @@ void PotentialFlory::correctFields() {
         return;
     }
 
-    // Assign species I and J
-    for ( int i=0 ; i<mybox->Species.size() ; i++ ) {
-        if ( actsOn[0] == mybox->Species[i].fts_species ) { d_rhoI = mybox->Species[i].d_density; }
-        else if ( actsOn[1] == mybox->Species[i].fts_species ) { d_rhoJ = mybox->Species[i].d_density; }
-    }
-
-    // Pointers to the thrust data
-    cuDoubleComplex* _d_dHdwpl = (cuDoubleComplex*)thrust::raw_pointer_cast(d_dHdwpl.data());
-    cuDoubleComplex* _d_dHdwmi = (cuDoubleComplex*)thrust::raw_pointer_cast(d_dHdwmi.data());
-    cuDoubleComplex* _d_rhoI = (cuDoubleComplex*)thrust::raw_pointer_cast(d_rhoI.data());
-    cuDoubleComplex* _d_rhoJ = (cuDoubleComplex*)thrust::raw_pointer_cast(d_rhoJ.data());
-    cuDoubleComplex* _d_wpl = (cuDoubleComplex*)thrust::raw_pointer_cast(d_wpl.data());
-    cuDoubleComplex* _d_wmi = (cuDoubleComplex*)thrust::raw_pointer_cast(d_wmi.data());
-    cuDoubleComplex* _d_wplo = (cuDoubleComplex*)thrust::raw_pointer_cast(d_wplo.data());
-    cuDoubleComplex* _d_wmio = (cuDoubleComplex*)thrust::raw_pointer_cast(d_wmio.data());
-    cuDoubleComplex* _d_dHdwplo = (cuDoubleComplex*)thrust::raw_pointer_cast(d_dHdwplo.data());
-    cuDoubleComplex* _d_dHdwmio = (cuDoubleComplex*)thrust::raw_pointer_cast(d_dHdwmio.data());
-
-    // Forces are generated in real space
-    d_makeFloryForce<<<mybox->M_Grid, mybox->M_Block>>>(_d_dHdwpl, _d_dHdwmi, _d_wpl,
-        _d_wmi, _d_rhoI, _d_rhoJ, mybox->C, chiN, mybox->Nr, mybox->M);
+    computeForce();
+    auto* _d_wpl = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_wpl.data()));
+    auto* _d_wmi = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_wmi.data()));
+    const auto* _d_dHdwpl = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdwpl.data()));
+    const auto* _d_dHdwmi = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdwmi.data()));
+    const auto* _d_dHdwplo = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdwplo.data()));
+    const auto* _d_dHdwmio = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdwmio.data()));
+    const auto* _d_wplo = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_wplo.data()));
+    const auto* _d_wmio = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_wmio.data()));
 
     // Update the fields
     d_fts_updateEMPC<<<mybox->M_Grid, mybox->M_Block>>>(_d_wpl, _d_wplo, _d_dHdwpl, _d_dHdwplo, deltPlus, mybox->M);

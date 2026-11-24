@@ -33,6 +33,8 @@ class PotentialFlory : public FTS_Potential {
         void storePredictorData() override;
         void initLinearCoeffs() override;
 
+        int speciesI, speciesJ;
+        void computeForce();
         thrust::device_vector<thrust::complex<double>> d_rhoI;
         thrust::device_vector<thrust::complex<double>> d_rhoJ;
         thrust::device_vector<thrust::complex<double>> d_dHdwpl;

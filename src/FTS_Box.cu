@@ -13,6 +13,7 @@
 #include "scft_race.h"
 
 #include <cstdlib>
+#include <string_view>
 
 void die(const char*);
 FTS_Molec* FTS_MolecFactory(std::istringstream&, FTS_Box*);
@@ -615,7 +616,16 @@ void FTS_Box::writeFields() {
 
 FTS_Box::~FTS_Box() {}
 
-FTS_Box::FTS_Box(std::istringstream& iss ) : Box(iss) {
+namespace {
+int fieldAssemblyMode() {
+    const char* value = std::getenv("SCFT_MATILDA_FIELD_ASSEMBLY");
+    const std::string_view mode = value ? value : "";
+    if (mode == "1" || mode == "2" || mode == "3") return mode[0] - '0';
+    return 0;
+}
+}
+
+FTS_Box::FTS_Box(std::istringstream& iss ) : Box(iss), fieldAssembly(fieldAssemblyMode()) {
     std::string s1;
     iss >> ftsStyle;
 

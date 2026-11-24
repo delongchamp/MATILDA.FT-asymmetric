@@ -3,6 +3,8 @@
 
 
 #include "fts_species.h"
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/execution_policy.h>
 
 void die(const char*);
 
@@ -48,8 +50,75 @@ struct plusITimes {
 
 
 
+namespace {
+using Complex = thrust::complex<double>;
+
+struct BuildSpeciesField {
+    enum Operation { Add, Subtract, AddImaginary };
+    struct Term {
+        const Complex* field;
+        Operation operation;
+    };
+    Term terms[8];
+    int count = 0;
+    Complex scale;
+
+    bool append(const thrust::device_vector<Complex>& field, Operation operation) {
+        if (count == 8) return false;
+        terms[count++] = {thrust::raw_pointer_cast(field.data()), operation};
+        return true;
+    }
+
+    __host__ __device__ Complex operator()(int i) const {
+        Complex value(0.0, 0.0);
+        for (int term = 0; term < count; ++term) {
+            const auto entry = terms[term];
+            const Complex operand = entry.field[i];
+            switch (entry.operation) {
+                case Add: value += operand; break;
+                case Subtract: value -= operand; break;
+                case AddImaginary: value += Complex(0.0, 1.0) * operand; break;
+            }
+        }
+        return value * scale;
+    }
+};
+
+struct ScaleSpeciesField {
+    Complex scale;
+    __host__ __device__ Complex operator()(const Complex& value) const { return value * scale; }
+};
+}
+
 // Loops over potentials and constructs the fields for each species
 void FTS_Species::buildPotentialField() {
+    if (box->fieldAssembly == 3) {
+        BuildSpeciesField build{};
+        build.scale = 1.0 / box->Nr;
+        bool supported = true;
+        for (auto* potential : box->Potentials) {
+            const auto style = potential->printStyle();
+            if (style == "Incompress") {
+                supported = build.append(potential->d_wpl, BuildSpeciesField::AddImaginary);
+            } else if (style == "Flory" && fts_species == potential->actsOn[0]) {
+                supported = build.append(potential->d_wmi, BuildSpeciesField::Subtract)
+                    && build.append(potential->d_wpl, BuildSpeciesField::AddImaginary);
+            } else if (style == "Flory" && fts_species == potential->actsOn[1]) {
+                supported = build.append(potential->d_wmi, BuildSpeciesField::Add)
+                    && build.append(potential->d_wpl, BuildSpeciesField::AddImaginary);
+            } else if (style == "Particle" && fts_species == potential->actsOn[0]) {
+                supported = build.append(potential->d_wpl, BuildSpeciesField::Add);
+            } else if (style != "Flory" && style != "Particle") {
+                supported = false;
+            }
+            if (!supported) break;
+        }
+        if (supported) {
+            const auto first = thrust::make_counting_iterator(0);
+            thrust::transform(thrust::device, first, first + box->M, d_w.begin(), build);
+            return;
+        }
+    }
 
     // Zero the fields
     thrust::fill(d_w.begin(), d_w.end(), thrust::complex<double>(0.0,0.0));
@@ -114,10 +183,14 @@ void FTS_Species::buildPotentialField() {
     }// i=0:potentials.size()
 
     // Normalize the field by Nr
-    thrust::device_vector<thrust::complex<double>> invNr(box->M);
-    thrust::fill(invNr.begin(), invNr.end(), 1.0/double(box->Nr));
-    thrust::transform(d_w.begin(), d_w.end(), invNr.begin(), d_w.begin(),   
-                        thrust::multiplies<thrust::complex<double>>());
+    if (box->fieldAssembly >= 1) {
+        thrust::transform(d_w.begin(), d_w.end(), d_w.begin(), ScaleSpeciesField{1.0 / box->Nr});
+    } else {
+        thrust::device_vector<thrust::complex<double>> invNr(box->M);
+        thrust::fill(invNr.begin(), invNr.end(), 1.0/double(box->Nr));
+        thrust::transform(d_w.begin(), d_w.end(), invNr.begin(), d_w.begin(),
+                          thrust::multiplies<thrust::complex<double>>());
+    }
 
 
     // thrust::host_vector<thrust::complex<double>> htmp(box->M);

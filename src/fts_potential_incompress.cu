@@ -8,6 +8,8 @@
 #include "fts_species.h"
 #include <cmath>
 #include <cstdlib>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/execution_policy.h>
 //#include "globals.h"
 
 void die(const char*);
@@ -33,7 +35,7 @@ PotentialIncompress::PotentialIncompress(std::istringstream& iss, FTS_Box* p_box
     d_Akpl.resize(mybox->M, ivalue);
     wplAlloc_flag = 1;
 
-    d_rho_total.resize(mybox->M, ivalue);
+    if (mybox->fieldAssembly != 3) d_rho_total.resize(mybox->M, ivalue);
     d_dHdw.resize(mybox->M, ivalue);
 
     // Set default update scheme
@@ -84,28 +86,52 @@ PotentialIncompress::PotentialIncompress(std::istringstream& iss, FTS_Box* p_box
 // Updates potential fields using the chosen scheme
 // If two-part predictor/corrector scheme is to be used, then 
 // this step is the predictor step
+namespace {
+using Complex = thrust::complex<double>;
+
+struct PressureForce {
+    const Complex* species[3];
+    int count;
+    double Nr;
+    double C;
+
+    __host__ __device__ Complex operator()(int i) const {
+        Complex total(0.0, 0.0);
+        for (int j = 0; j < count; ++j) total += species[j][i];
+        return Complex(-total.imag() / Nr, total.real() / Nr - C);
+    }
+};
+}
+
+void PotentialIncompress::computeForce() {
+    const auto size = mybox->Species.size();
+    if (mybox->fieldAssembly == 3 && size <= 3) {
+        PressureForce force{{}, static_cast<int>(size), mybox->Nr, mybox->C};
+        for (size_t j = 0; j < size; ++j) {
+            force.species[j] = thrust::raw_pointer_cast(mybox->Species[j].d_density.data());
+        }
+        const auto first = thrust::make_counting_iterator(0);
+        thrust::transform(thrust::device, first, first + mybox->M, d_dHdw.begin(), force);
+        return;
+    }
+    if (d_rho_total.empty()) d_rho_total.resize(mybox->M);
+    thrust::fill(d_rho_total.begin(), d_rho_total.end(), 0.0);
+    for (const auto& species : mybox->Species) {
+        thrust::transform(species.d_density.begin(), species.d_density.end(),
+            d_rho_total.begin(), d_rho_total.begin(), thrust::plus<Complex>());
+    }
+    auto* force = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdw.data()));
+    const auto* field = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_wpl.data()));
+    const auto* density = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_rho_total.data()));
+    d_makeIncompressForce<<<mybox->M_Grid, mybox->M_Block>>>(force, field, density, mybox->C,
+        mybox->Nr, mybox->M);
+}
+
 void PotentialIncompress::updateFields() {
 
-    // Initialize to zero
-    thrust::fill(d_rho_total.begin(), d_rho_total.end(), 0.0);
-
-    
-    // Loop over species, adding them to the field
-    for ( int i=0 ; i<mybox->Species.size() ; i++ ) {
-        thrust::transform(mybox->Species[i].d_density.begin(), mybox->Species[i].d_density.begin()+mybox->M,
-            d_rho_total.begin(), d_rho_total.begin(), thrust::plus<thrust::complex<double>>());
-    }
-
-
-
-    // cast thrust vectors to cuDoubleComplex for use in kernel
-    cuDoubleComplex* _d_dHdw = (cuDoubleComplex*)thrust::raw_pointer_cast(d_dHdw.data());
-    cuDoubleComplex* _d_wpl = (cuDoubleComplex*)thrust::raw_pointer_cast(d_wpl.data());
-    cuDoubleComplex* _d_rho_total = (cuDoubleComplex*)thrust::raw_pointer_cast(d_rho_total.data());
-
-    // Make the force in real space
-    d_makeIncompressForce<<<mybox->M_Grid, mybox->M_Block>>>(_d_dHdw, _d_wpl, _d_rho_total, mybox->C,
-        mybox->Nr, mybox->M);
+    computeForce();
+    auto* _d_wpl = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_wpl.data()));
+    auto* _d_dHdw = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdw.data()));
 
 
 
@@ -157,29 +183,11 @@ void PotentialIncompress::correctFields() {
         return;
     }
 
-    // Initialize to zero
-    thrust::fill(d_rho_total.begin(), d_rho_total.end(), 0.0);
-
-    
-    // Loop over species, adding them to the field
-    for ( int i=0 ; i<mybox->Species.size() ; i++ ) {
-        thrust::transform(mybox->Species[i].d_density.begin(), mybox->Species[i].d_density.begin()+mybox->M,
-            d_rho_total.begin(), d_rho_total.begin(), thrust::plus<thrust::complex<double>>());
-    }
-
-
-
-    // cast thrust vectors to cuDoubleComplex for use in kernel
-    cuDoubleComplex* _d_dHdw = (cuDoubleComplex*)thrust::raw_pointer_cast(d_dHdw.data());
-    cuDoubleComplex* _d_wpl = (cuDoubleComplex*)thrust::raw_pointer_cast(d_wpl.data());
-    cuDoubleComplex* _d_rho_total = (cuDoubleComplex*)thrust::raw_pointer_cast(d_rho_total.data());
-
-    cuDoubleComplex* _d_dHdwplo = (cuDoubleComplex*)thrust::raw_pointer_cast(d_dHdwplo.data());
-    cuDoubleComplex* _d_wplo = (cuDoubleComplex*)thrust::raw_pointer_cast(d_wplo.data());
-
-    // Make the force in real space
-    d_makeIncompressForce<<<mybox->M_Grid, mybox->M_Block>>>(_d_dHdw, _d_wpl, _d_rho_total, mybox->C,
-        mybox->Nr, mybox->M);
+    computeForce();
+    auto* _d_wpl = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_wpl.data()));
+    auto* _d_dHdw = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdw.data()));
+    const auto* _d_dHdwplo = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_dHdwplo.data()));
+    const auto* _d_wplo = reinterpret_cast<const cuDoubleComplex*>(thrust::raw_pointer_cast(d_wplo.data()));
 
 
     // Corrector step for field updates

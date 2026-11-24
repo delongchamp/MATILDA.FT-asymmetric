@@ -35,6 +35,7 @@ class PotentialIncompress : public FTS_Potential {
         void correctFields() override;
         
         // This field should contain the *smeared* density fields
+        void computeForce();
         thrust::device_vector<thrust::complex<double>> d_rho_total;
 
         // Vector to store the force term

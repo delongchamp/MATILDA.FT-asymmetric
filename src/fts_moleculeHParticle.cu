@@ -183,6 +183,7 @@ ParticleMolec::ParticleMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Mole
 
     //transfer density to device
     d_NPdensity = density;
+    if (mybox->fieldAssembly >= 2) d_density = d_NPdensity;
     int is = intSpecies[0];
 
     // Also need to accumulate density onto the relevant species fields
@@ -191,7 +192,7 @@ ParticleMolec::ParticleMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Mole
 
 
 void ParticleMolec::calcDensity() {
-    d_density=d_NPdensity;            
+    if (mybox->fieldAssembly < 2) d_density = d_NPdensity;
      int is = intSpecies[0]; 
     thrust::transform(d_density.begin(), d_density.end(),  mybox->Species[is].d_density.begin(), mybox->Species[is].d_density.begin(), thrust::plus<thrust::complex<double>>());
     // calcHamiltonian();
