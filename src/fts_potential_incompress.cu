@@ -6,6 +6,8 @@
 #include "fts_potential_incompress.h"
 #include "FTS_Box.h"
 #include "fts_species.h"
+#include <cmath>
+#include <cstdlib>
 //#include "globals.h"
 
 void die(const char*);
@@ -55,6 +57,18 @@ PotentialIncompress::PotentialIncompress(std::istringstream& iss, FTS_Box* p_box
     }// optional arguments
 
     d_wpl = wpl;
+
+    if (const char* setting = std::getenv("SCFT_MATILDA_PRESSURE_STEP")) {
+        char* end = nullptr;
+        const double multiplier = std::strtod(setting, &end);
+        if (end == setting || *end || !std::isfinite(multiplier) || multiplier <= 0.0) {
+            die("SCFT_MATILDA_PRESSURE_STEP must be a positive finite number");
+        }
+        if (multiplier != 1.0 && updateScheme == "EMPC" && mybox->returnFTSstyle() == "scft") {
+            delt *= multiplier;
+            std::cout << "EMPC pressure multiplier " << multiplier << ", step " << delt << std::endl;
+        }
+    }
 
     if ( updateScheme == "EMPC" ) {
         d_dHdwplo.resize(mybox->M, ivalue);        
