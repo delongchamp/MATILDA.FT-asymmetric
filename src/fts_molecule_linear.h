@@ -17,13 +17,16 @@ class LinearMolec : public FTS_Molec {
     private:
         const bool directBond;
         const bool foldBondScale;
+        bool isSymmetric = true;
+        bool shareReverse = false;
+        bool fuseDensity = false;
+        thrust::device_vector<thrust::complex<double>> d_qdag;
 
         void propagateBondStep(thrust::device_ptr<const thrust::complex<double>> previous,
                                thrust::device_ptr<thrust::complex<double>> next);
 
     public:
         int numBlocks;
-        bool isSymmetric = true;
 
         thrust::device_vector<int> d_N;                     // [numBlocks] length of each block
         thrust::host_vector<int> N;                         // [numBlocks] length of each block
@@ -35,7 +38,6 @@ class LinearMolec : public FTS_Molec {
         
 
         thrust::device_vector<thrust::complex<double>> d_q;    // [Ntot*M] Chain propagator
-        thrust::device_vector<thrust::complex<double>> d_qdag; // [Ntot*M] inverse propagator
 
         // [M] Fourier bond symbol, including 1/M in folded mode
         thrust::device_vector<thrust::complex<double>> d_bond_fft;    
@@ -53,6 +55,7 @@ class LinearMolec : public FTS_Molec {
         ~LinearMolec();
         LinearMolec(std::istringstream& iss, FTS_Box*);
 
+        thrust::device_ptr<const thrust::complex<double>> reverseHistory() const;
         void calcPropagators();
         void calcDensity() override;
         std::complex<double> calcHTerm() override;

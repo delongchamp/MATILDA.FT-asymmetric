@@ -8,6 +8,8 @@
 #include <thrust/host_vector.h>
 #include <thrust/complex.h>
 #include <thrust/copy.h>
+#include <thrust/execution_policy.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <cstdlib>
 #include <string_view>
 #include "FTS_Box.h"
@@ -15,7 +17,7 @@
 void die(const char*);
 
 namespace {
-bool bondOptionEnabled(const char* name) {
+bool optionEnabled(const char* name) {
     const char* value = std::getenv(name);
     return value && std::string_view(value) == "1";
 }
@@ -25,8 +27,8 @@ LinearMolec::~LinearMolec(){}
 
 LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
     : FTS_Molec(iss, p_box),
-      directBond(bondOptionEnabled("SCFT_MATILDA_BOND_DIRECT")),
-      foldBondScale(bondOptionEnabled("SCFT_MATILDA_BOND_FOLD_SCALE")) {
+      directBond(optionEnabled("SCFT_MATILDA_BOND_DIRECT")),
+      foldBondScale(optionEnabled("SCFT_MATILDA_BOND_FOLD_SCALE")) {
     // iss comes into this routine having already passed "molecule" and "linear"
     // structure of iss should be:
     // numBlocks, integer
@@ -83,13 +85,7 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
     // Copy block lengths to device
     d_N = N;
 
-    // Allocate forward and backwards propagators
-    d_q.resize(Ntot*mybox->M);
-    d_qdag.resize(Ntot*mybox->M);
-
-
-    // Check for symmetry of the molecule. If symmetric, d_qdag = d_q
-    // saving Ntot*M calcs.
+    // Both ends use the same free-end condition. Compare the block sequence in reverse.
     for ( int j=0 ; j<numBlocks/2 ; j++ ) {
         if ( ( blockSpecies[j] != blockSpecies[numBlocks-1-j] ) ||    // Block Species are unequal
              (N[j] != N[numBlocks-1-j]) )  {                    // Block lengths are unequal
@@ -98,6 +94,9 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
             break;
         }
     }
+    shareReverse = isSymmetric && optionEnabled("SCFT_MATILDA_SHARE_REVERSE");
+    d_q.resize(Ntot * mybox->M);
+    if (!shareReverse) d_qdag.resize(d_q.size());
 
     // Determine integer block Species
     for ( int j=0 ; j<numBlocks; j++ ) {
@@ -141,8 +140,15 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
     hf.resize(mybox->M);
     a.resize(mybox->M);
     expW.resize(mybox->M);
-    q_qdag.resize(mybox->M);
-    temp.resize(mybox->M);
+    fuseDensity = !doSmear && optionEnabled("SCFT_MATILDA_FUSE_DENSITY");
+    if (!fuseDensity) {
+        q_qdag.resize(mybox->M);
+        temp.resize(mybox->M);
+    }
+}
+
+thrust::device_ptr<const thrust::complex<double>> LinearMolec::reverseHistory() const {
+    return shareReverse ? d_q.data() : d_qdag.data();
 }
 
 struct NegExponential {
@@ -220,9 +226,8 @@ void LinearMolec::calcPropagators() {
     }// b=0:numBlocks
 
 
-    // If the molecule is symmetric, d_qdag = d_q
     if ( isSymmetric ) {
-        d_qdag = d_q;
+        if (!shareReverse) d_qdag = d_q;
     }
 
     //////////////////////////////
@@ -280,6 +285,25 @@ struct Exponential {
     }
 };
 
+namespace {
+struct ContourDensity {
+    const thrust::complex<double>* forward;
+    const thrust::complex<double>* reverse;
+    const thrust::complex<double>* field;
+    thrust::complex<double> factor;
+    int sites;
+    int gridSize;
+
+    __host__ __device__ thrust::complex<double> operator()(int voxel) const {
+        thrust::complex<double> density(0.0);
+        for (int site = 0; site < sites; ++site) {
+            density += forward[site * gridSize + voxel] * reverse[voxel - site * gridSize];
+        }
+        return density * (factor * exp(field[voxel]));
+    }
+};
+}
+
 void LinearMolec::calcDensity() {
 
     // First, calculate the propagators
@@ -296,18 +320,27 @@ void LinearMolec::calcDensity() {
     }
 
 
-    // Zero all block density fields
-    thrust::fill(d_cDensity.begin(), d_cDensity.end(), 0.0);
+    const auto reverse = reverseHistory();
+    if (!fuseDensity) thrust::fill(d_cDensity.begin(), d_cDensity.end(), 0.0);
     int ind = 0;
     for ( int b=0 ; b<numBlocks; b++ ) {
-        
+        if (fuseDensity) {
+            const auto voxel = thrust::make_counting_iterator(0);
+            const auto& field = mybox->Species[intSpecies[b]].d_w;
+            thrust::transform(thrust::device, voxel, voxel + M, d_cDensity.begin() + b * M,
+                ContourDensity{thrust::raw_pointer_cast(d_q.data() + ind * M),
+                               thrust::raw_pointer_cast(reverse + (Ntot - 1 - ind) * M),
+                               thrust::raw_pointer_cast(field.data()), factor, N[b], M});
+            ind += N[b];
+            continue;
+        }
 
         // Accumulate density of all monomers in this block
         for ( int s=0 ; s<N[b]; s++ ) {
 
             // q_qdag[:] = q[ind][:] * qdag[Ntot-1-ind][:]
             thrust::transform(d_q.begin()+ind*M, d_q.begin()+(ind+1)*M, 
-                                d_qdag.begin()+(Ntot-1-ind)*M, q_qdag.begin(),
+                                reverse+(Ntot-1-ind)*M, q_qdag.begin(),
                                 thrust::multiplies<thrust::complex<double>>());                                 
 
             // cDensity[:] += q_qdag[:]
