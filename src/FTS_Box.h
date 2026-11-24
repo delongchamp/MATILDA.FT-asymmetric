@@ -29,6 +29,7 @@ class FTS_Box : public Box {
         std::complex<double> Heff;  // Effective Hamiltonian
         const int fieldAssembly;           // 0 legacy, 1 scalar, 2 aliases, 3 fused
         int PCflag;         // Flag for using predictor-corrector methods
+        size_t densityEvaluations = 0;
         
 
         // Data for tolerance checks

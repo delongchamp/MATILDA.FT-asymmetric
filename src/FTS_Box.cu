@@ -20,6 +20,7 @@ FTS_Molec* FTS_MolecFactory(std::istringstream&, FTS_Box*);
 FTS_Potential* FTS_PotentialFactory(std::istringstream&, FTS_Box*);
 
 void FTS_Box::calcMoleculeDensities() {
+    ++densityEvaluations;
     const auto enabled = [](const char* name) {
         const char* value = std::getenv(name);
         return value && std::string_view(value) == "1";

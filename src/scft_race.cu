@@ -5,6 +5,7 @@
 #include "FTS_Box.h"
 #include "fts_molecule_linear.h"
 #include "fts_potential_flory.h"
+#include "fts_potential_incompress.h"
 #include "fts_potentialParticle.h"
 #include "fts_species.h"
 #include "git-version.h"
@@ -14,6 +15,7 @@
 #include <thrust/transform_reduce.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -143,6 +145,8 @@ struct BinaryModel {
     }
 };
 
+#include "scft_anderson.cuh"
+
 struct Sums {
     double weight = 0.0, pressure = 0.0, exchange = 0.0, driftA = 0.0, driftB = 0.0;
     double a = 0.0, b = 0.0, mask = 0.0, minFraction = 0.0;
@@ -256,8 +260,10 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     double closure = 0.0, exchange = 0.0, drift = 0.0;
     bool converged = false;
     const auto solveStart = Clock::now();
+    auto mixer = stopAtNative ? nullptr : createAnderson(box, model);
     for (int step = 0; step < nsteps; ++step) {
-        box.doTimeStep(step);
+        if (mixer) mixer->advance(step);
+        else box.doTimeStep(step);
         ++updates;
         const bool native = step >= 50 && !nativeStop && box.converged(step);
         if (native) nativeStop = updates;
@@ -285,7 +291,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
                 closure <= maximumClosure && exchange <= maximumExchange && drift <= maximumDrift;
             passing = pass ? passing + 1 : 0;
             converged = passing >= 2;
-            trace << updates << ',' << 1 + updates * (1 + (box.PCflag == 1)) << ',' <<
+            trace << updates << ',' << box.densityEvaluations << ',' <<
                 closure << ',' << exchange << ',' << drift << ',' << loadingError << ',' <<
                 meanA << ',' << meanB << ',' << sums.minFraction << ',' <<
                 sums.fieldImag << ',' << sums.densityImag << ',' << pass << '\n' << std::flush;
@@ -313,7 +319,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     meta << "{\n  \"revision\": \"" << MY_GIT_VERSION << "\",\n  \"converged\": " <<
         (converged && updates % checkEvery == 0 ? "true" : "false") <<
         ",\n  \"updates\": " << updates << ",\n  \"field_evals\": " <<
-        1 + updates * (1 + (box.PCflag == 1)) << ",\n  \"native_stop_update\": ";
+        box.densityEvaluations << ",\n  \"native_stop_update\": ";
     if (nativeStop) meta << nativeStop;
     else meta << "null";
     meta << ",\n  \"last_common_check_update\": " << updates / checkEvery * checkEvery <<
@@ -323,6 +329,12 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     if (updates >= checkEvery && std::isfinite(closure + exchange + drift)) {
         meta << ",\n  \"closure_rms\": " << closure << ",\n  \"exchange_rms\": " << exchange <<
             ",\n  \"drift_rms\": " << drift;
+    }
+    if (mixer) {
+        meta << ",\n  \"anderson_history\": " << mixer->history
+             << ",\n  \"anderson_mixed_steps\": " << mixer->mixedSteps
+             << ",\n  \"anderson_rejections\": " << mixer->rejections
+             << ",\n  \"anderson_restarts\": " << mixer->restarts;
     }
     meta << "\n}\n";
 }
