@@ -145,8 +145,15 @@ __global__ void finishBatch(const Complex* first, const Complex* second,
 struct BatchedBondExecution {
     StreamBondPlan plan;
     thrust::device_vector<Complex> frontier, spectrum;
+    bool warmed = false;
+    bool captureFailed = false;
+    cudaGraphExec_t graph = nullptr;
+    std::vector<const Complex*> capturedInputs, inputs;
     explicit BatchedBondExecution(FTS_Box& box)
         : plan(box, 2), frontier(size_t(2) * box.M), spectrum(size_t(2) * box.M) {}
+    ~BatchedBondExecution() {
+        if (graph) cudaGraphExecDestroy(graph);
+    }
 };
 
 LinearMolec::~LinearMolec() = default;
@@ -503,7 +510,49 @@ bool LinearMolec::calcPairedDensity(LinearMolec& other, bool batch, bool streams
         const auto& plan = batchedBond->plan;
         requireCuda(cudaEventRecord(plan.ready, nullptr));
         requireCuda(cudaStreamWaitEvent(plan.stream, plan.ready));
-        enqueueBatchedSweeps(other);
+        auto& bond = *batchedBond;
+        if (streamBond && streamBond->capture && bond.warmed && !bond.captureFailed) {
+            bond.inputs.clear();
+            for (auto* molecule : {this, &other}) {
+                bond.inputs.push_back(thrust::raw_pointer_cast(molecule->d_q.data()));
+                bond.inputs.push_back(thrust::raw_pointer_cast(molecule->reverseHistory()));
+                for (int species : molecule->intSpecies) {
+                    bond.inputs.push_back(thrust::raw_pointer_cast(mybox->Species[species].d_w.data()));
+                }
+            }
+            if (!bond.graph || bond.inputs != bond.capturedInputs) {
+                if (bond.graph) requireCuda(cudaGraphExecDestroy(bond.graph));
+                bond.graph = nullptr;
+                const auto start = std::chrono::steady_clock::now();
+                cudaGraph_t captured = nullptr;
+                auto status = cudaStreamBeginCapture(plan.stream, cudaStreamCaptureModeThreadLocal);
+                if (status == cudaSuccess) {
+                    try {
+                        enqueueBatchedSweeps(other);
+                    } catch (const std::runtime_error&) {
+                        status = cudaErrorStreamCaptureInvalidated;
+                    }
+                    const auto ended = cudaStreamEndCapture(plan.stream, &captured);
+                    if (status == cudaSuccess) status = ended;
+                }
+                if (status == cudaSuccess) status = cudaGraphInstantiate(&bond.graph, captured, 0);
+                if (captured) requireCuda(cudaGraphDestroy(captured));
+                if (status == cudaSuccess) {
+                    bond.capturedInputs = bond.inputs;
+                    const auto us = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - start).count();
+                    std::cout << "Batch-two graph instantiated, build us " << us << std::endl;
+                } else {
+                    bond.captureFailed = true;
+                    std::cout << "Batch graph capture unavailable, using eager stream: "
+                              << cudaGetErrorString(status) << std::endl;
+                    (void)cudaGetLastError();
+                }
+            }
+        }
+        if (bond.graph) requireCuda(cudaGraphLaunch(bond.graph, plan.stream));
+        else enqueueBatchedSweeps(other);
+        bond.warmed = true;
         requireCuda(cudaEventRecord(plan.complete, plan.stream));
         requireCuda(cudaStreamWaitEvent(nullptr, plan.complete));
     } else if (streams) {

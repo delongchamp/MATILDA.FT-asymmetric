@@ -224,9 +224,8 @@ void FTS_Box::finishInitialization() {
     }
 
     // Calculate all density fields, including populating species densities
+    calcMoleculeDensities();
     for ( int i=0 ; i<Molecs.size(); i++ ) {
-        Molecs[i]->calcDensity();
-
         if ( Molecs[i]->molec_type != "HParticle" ) {
             outline += "Q[" + std::to_string(i) + "] ";
 
