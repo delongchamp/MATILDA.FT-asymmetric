@@ -309,10 +309,8 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
 
 
     // Allocate temp storage data
-    W.resize(mybox->M);
+    if (doSmear) W.resize(mybox->M);
     if (!directBond) qf.resize(mybox->M);
-    hf.resize(mybox->M);
-    a.resize(mybox->M);
     expW.resize(mybox->M);
     fuseDensity = !doSmear && optionEnabled("SCFT_MATILDA_FUSE_DENSITY");
     const char* streamMode = std::getenv("SCFT_MATILDA_BOND_GRAPH");
@@ -403,6 +401,10 @@ void LinearMolec::enqueueStreamSweeps() {
 }
 
 void LinearMolec::submitStreamPropagators(bool join, bool exclusive) {
+    if (a.empty()) {
+        a.resize(mybox->M);
+        hf.resize(mybox->M);
+    }
     auto& execution = *streamBond;
     if (!execution.plan || (exclusive && !execution.exclusive)) {
         if (execution.graph) requireCuda(cudaGraphExecDestroy(execution.graph));
@@ -637,6 +639,10 @@ void LinearMolec::calcPropagators() {
     if (streamBond) {
         submitStreamPropagators(true, false);
     } else {
+    if (directBond && a.empty()) {
+        a.resize(mybox->M);
+        hf.resize(mybox->M);
+    }
     
 
     //////////////////////////////////

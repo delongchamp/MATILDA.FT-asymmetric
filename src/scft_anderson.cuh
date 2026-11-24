@@ -240,6 +240,12 @@ std::unique_ptr<AndersonMixer> createAnderson(FTS_Box& box, const BinaryModel& m
         if (auto* candidate = dynamic_cast<PotentialFlory*>(potential)) flory = candidate;
     }
     if (!pressure || !flory) return nullptr;
+    // The mixer evaluates forces directly. EMPC recreates these snapshots by
+    // assignment if a later run selects the predictor/corrector iterator.
+    for (auto* snapshot : {&pressure->d_wplo, &pressure->d_dHdwplo,
+                           &flory->d_wplo, &flory->d_wmio, &flory->d_dHdwplo, &flory->d_dHdwmio}) {
+        DeviceField{}.swap(*snapshot);
+    }
     std::cout << "Single-evaluation controller, Anderson history " << history << '\n';
     return std::make_unique<AndersonMixer>(box, *pressure, *flory, history);
 }
