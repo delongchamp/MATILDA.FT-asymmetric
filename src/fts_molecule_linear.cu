@@ -59,7 +59,7 @@ struct StreamBondPlan {
     cufftHandle fft = 0;
     size_t workspaceBytes = 0;
 
-    explicit StreamBondPlan(FTS_Box& box, int batch = 1) {
+    explicit StreamBondPlan(FTS_Box& box, int batch = 1, cufftType type = CUFFT_Z2Z) {
         try {
             requireCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
             requireCuda(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
@@ -70,7 +70,7 @@ struct StreamBondPlan {
                 int lengths[3];
                 for (int j = 0; j < dim; ++j) lengths[j] = box.Nx[dim - 1 - j];
                 requireFft(cufftMakePlanMany(fft, dim, lengths, lengths, 1, box.M,
-                    lengths, 1, box.M, CUFFT_Z2Z, batch, &workspaceBytes));
+                    lengths, 1, box.M, type, batch, &workspaceBytes));
             } else if (box.returnDimension() == 2) {
                 requireFft(cufftMakePlan2d(fft, box.Nx[1], box.Nx[0], CUFFT_Z2Z, &workspaceBytes));
             } else {
@@ -97,6 +97,10 @@ struct StreamBondPlan {
     void enqueueZ2Z(Complex* input, Complex* output, int direction) const {
         requireFft(cufftExecZ2Z(fft, reinterpret_cast<cufftDoubleComplex*>(input),
             reinterpret_cast<cufftDoubleComplex*>(output), direction));
+    }
+
+    void enqueueC2C(cufftComplex* input, cufftComplex* output, int direction) const {
+        requireFft(cufftExecC2C(fft, input, output, direction));
     }
 };
 
@@ -140,17 +144,54 @@ __global__ void finishBatch(const Complex* first, const Complex* second,
     firstHistory[i] = frontier[i] = frontier[i] * first[i];
     secondHistory[i] = frontier[count + i] = frontier[count + i] * second[i];
 }
+
+__global__ void seedFloatBatch(const Complex* first, const Complex* second,
+                               cufftComplex* frontier, Complex* firstHistory, Complex* secondHistory, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    firstHistory[i] = first[i];
+    secondHistory[i] = second[i];
+    frontier[i] = make_cuFloatComplex(static_cast<float>(first[i].real()), static_cast<float>(first[i].imag()));
+    frontier[count + i] = make_cuFloatComplex(static_cast<float>(second[i].real()), static_cast<float>(second[i].imag()));
+}
+
+__global__ void scaleFloatBatch(const Complex* foldedSymbol, cufftComplex* spectrum, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float folded = static_cast<float>(foldedSymbol[i].real());
+    spectrum[i].x *= folded;
+    spectrum[i].y *= folded;
+    spectrum[count + i].x *= folded;
+    spectrum[count + i].y *= folded;
+}
+
+__global__ void finishFloatBatch(const Complex* first, const Complex* second, cufftComplex* frontier,
+                                 Complex* firstHistory, Complex* secondHistory, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const auto a = frontier[i], b = frontier[count + i];
+    const Complex left = Complex(a.x, a.y) * first[i];
+    const Complex right = Complex(b.x, b.y) * second[i];
+    firstHistory[i] = left;
+    secondHistory[i] = right;
+    frontier[i] = make_cuFloatComplex(static_cast<float>(left.real()), static_cast<float>(left.imag()));
+    frontier[count + i] = make_cuFloatComplex(static_cast<float>(right.real()), static_cast<float>(right.imag()));
+}
 }
 
 struct BatchedBondExecution {
     StreamBondPlan plan;
     thrust::device_vector<Complex> frontier, spectrum;
+    thrust::device_vector<cufftComplex> floatFrontier, floatSpectrum;
+    const bool mixed;
     bool warmed = false;
     bool captureFailed = false;
     cudaGraphExec_t graph = nullptr;
     std::vector<const Complex*> capturedInputs, inputs;
-    explicit BatchedBondExecution(FTS_Box& box)
-        : plan(box, 2), frontier(size_t(2) * box.M), spectrum(size_t(2) * box.M) {}
+    BatchedBondExecution(FTS_Box& box, bool mixed_)
+        : plan(box, 2, mixed_ ? CUFFT_C2C : CUFFT_Z2Z),
+          frontier(mixed_ ? 0 : size_t(2) * box.M), spectrum(frontier.size()),
+          floatFrontier(mixed_ ? size_t(2) * box.M : 0), floatSpectrum(floatFrontier.size()), mixed(mixed_) {}
     ~BatchedBondExecution() {
         if (graph) cudaGraphExecDestroy(graph);
     }
@@ -436,7 +477,7 @@ void LinearMolec::joinStreamPropagators() {
 }
 
 void LinearMolec::enqueueBatchedSweeps(LinearMolec& other) {
-    const auto& bond = *batchedBond;
+    auto& bond = *batchedBond;
     const auto& plan = bond.plan;
     const auto stream = plan.stream;
     const int count = mybox->M;
@@ -444,6 +485,8 @@ void LinearMolec::enqueueBatchedSweeps(LinearMolec& other) {
     const int grid = (count + threads - 1) / threads;
     auto* frontier = thrust::raw_pointer_cast(batchedBond->frontier.data());
     auto* spectrum = thrust::raw_pointer_cast(batchedBond->spectrum.data());
+    auto* floatFrontier = thrust::raw_pointer_cast(bond.floatFrontier.data());
+    auto* floatSpectrum = thrust::raw_pointer_cast(bond.floatSpectrum.data());
     auto* firstWeight = thrust::raw_pointer_cast(expW.data());
     auto* secondWeight = thrust::raw_pointer_cast(other.expW.data());
     const auto* symbol = thrust::raw_pointer_cast(d_bond_fft.data());
@@ -468,6 +511,19 @@ void LinearMolec::enqueueBatchedSweeps(LinearMolec& other) {
         for (size_t site = 0; site < size_t(Ntot); ++site) {
             first.loadIfNeeded(site, firstWeight, grid, threads, count, stream);
             second.loadIfNeeded(site, secondWeight, grid, threads, count, stream);
+            if (bond.mixed) {
+                if (site == 0) {
+                    seedFloatBatch<<<grid, threads, 0, stream>>>(firstWeight, secondWeight,
+                        floatFrontier, firstTape, secondTape, count);
+                    continue;
+                }
+                plan.enqueueC2C(floatFrontier, floatSpectrum, CUFFT_FORWARD);
+                scaleFloatBatch<<<grid, threads, 0, stream>>>(symbol, floatSpectrum, count);
+                plan.enqueueC2C(floatSpectrum, floatFrontier, CUFFT_INVERSE);
+                finishFloatBatch<<<grid, threads, 0, stream>>>(firstWeight, secondWeight, floatFrontier,
+                    firstTape + site * count, secondTape + site * count, count);
+                continue;
+            }
             if (site == 0) {
                 seedBatch<<<grid, threads, 0, stream>>>(firstWeight, secondWeight,
                     frontier, firstTape, secondTape, count);
@@ -502,9 +558,14 @@ bool LinearMolec::calcPairedDensity(LinearMolec& other, bool batch, bool streams
     if (dim != 2 && dim != 3) return false;
 
     if (batch && Ntot == other.Ntot && isSymmetric == other.isSymmetric) {
+        const char* mode = std::getenv("SCFT_MATILDA_FP32_BOND");
+        const bool mixed = !mybox->fullPrecisionBonds && mode
+            && (std::string_view(mode) == "1" || std::string_view(mode) == "polish");
+        if (batchedBond && batchedBond->mixed != mixed) batchedBond.reset();
         if (!batchedBond) {
-            batchedBond = std::make_unique<BatchedBondExecution>(*mybox);
-            std::cout << "Batch-two bond plan, " << 2 * mybox->M * sizeof(Complex) * 2
+            batchedBond = std::make_unique<BatchedBondExecution>(*mybox, mixed);
+            std::cout << (mixed ? "C2C FP32" : "Z2Z FP64") << " batch-two bond plan, "
+                      << 2 * size_t(mybox->M) * (mixed ? sizeof(cufftComplex) : sizeof(Complex)) * 2
                       << " frontier and spectrum bytes" << std::endl;
         }
         const auto& plan = batchedBond->plan;

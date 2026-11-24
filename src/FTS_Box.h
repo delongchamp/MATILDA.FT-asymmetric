@@ -30,6 +30,7 @@ class FTS_Box : public Box {
         const int fieldAssembly;           // 0 legacy, 1 scalar, 2 aliases, 3 fused
         int PCflag;         // Flag for using predictor-corrector methods
         size_t densityEvaluations = 0;
+        bool fullPrecisionBonds = false;
         
 
         // Data for tolerance checks

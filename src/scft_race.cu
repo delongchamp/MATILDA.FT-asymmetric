@@ -261,6 +261,9 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     bool converged = false;
     const auto solveStart = Clock::now();
     auto mixer = stopAtNative ? nullptr : createAnderson(box, model);
+    const char* precisionMode = std::getenv("SCFT_MATILDA_FP32_BOND");
+    const bool polish = precisionMode && std::string(precisionMode) == "polish" && !stopAtNative;
+    int polishUpdate = 0;
     for (int step = 0; step < nsteps; ++step) {
         if (mixer) mixer->advance(step);
         else box.doTimeStep(step);
@@ -279,6 +282,18 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
                 throw std::runtime_error("The observer found nonfinite fields or an empty pore");
             }
             closure = std::sqrt(sums.pressure / box.M);
+            const bool startPolish = polish && !box.fullPrecisionBonds && closure <= 0.004;
+            if (startPolish) {
+                box.fullPrecisionBonds = true;
+                polishUpdate = updates;
+                passing = 0;
+                for (auto& species : box.Species) species.zeroDensity();
+                box.calcMoleculeDensities();
+                if (mixer) mixer->resetFromCurrentState();
+                sums = thrust::transform_reduce(thrust::device, first, first + box.M, perNode, Sums{}, AddSums{});
+                if (sums.invalid || sums.weight <= 0) throw std::runtime_error("Invalid FP64 polish state");
+                closure = std::sqrt(sums.pressure / box.M);
+            }
             exchange = std::sqrt(sums.exchange / sums.weight) / std::max(1.0, std::abs(model.chi));
             drift = std::sqrt(std::max(sums.driftA, sums.driftB) / sums.weight);
             const double available = 1.0 - sums.mask / box.M;
@@ -286,7 +301,8 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
             const double loadingError = model.canonical
                 ? std::max(std::abs(meanA - available * model.fractionA),
                            std::abs(meanB - available * model.fractionB)) : 0.0;
-            const bool pass = std::isfinite(closure + exchange + drift + loadingError) &&
+            const bool pass = (!polish || (box.fullPrecisionBonds && !startPolish)) &&
+                std::isfinite(closure + exchange + drift + loadingError) &&
                 loadingError <= 0.002 && sums.minFraction >= -0.005 &&
                 closure <= maximumClosure && exchange <= maximumExchange && drift <= maximumDrift;
             passing = pass ? passing + 1 : 0;
@@ -337,6 +353,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
              << ",\n  \"anderson_restarts\": " << mixer->restarts
              << ",\n  \"anderson_coefficient_clips\": " << mixer->clippedSteps;
     }
+    if (polishUpdate) meta << ",\n  \"fp64_bond_from_update\": " << polishUpdate;
     meta << "\n}\n";
 }
 }

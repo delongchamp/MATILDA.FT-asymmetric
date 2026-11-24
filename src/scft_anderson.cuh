@@ -90,9 +90,15 @@ struct AndersonMixer {
         : box(box_), pressure(pressure_), flory(flory_), history(history_),
           x(size_t(history + 1) * 3 * box.M), r(x.size()),
           partials((history + 1) * (history + 1) * mixPartials) {
+        resetFromCurrentState();
+    }
+
+    void resetFromCurrentState() {
+        head = 0;
+        retained = 1;
         capture(0);
         norm = residualNorm(0);
-        if (!std::isfinite(norm)) throw std::runtime_error("Nonfinite initial mixing residual");
+        if (!std::isfinite(norm)) throw std::runtime_error("Nonfinite residual at mixing restart");
     }
 
     MixFields fields() const {
