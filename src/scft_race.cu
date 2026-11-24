@@ -334,7 +334,8 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         meta << ",\n  \"anderson_history\": " << mixer->history
              << ",\n  \"anderson_mixed_steps\": " << mixer->mixedSteps
              << ",\n  \"anderson_rejections\": " << mixer->rejections
-             << ",\n  \"anderson_restarts\": " << mixer->restarts;
+             << ",\n  \"anderson_restarts\": " << mixer->restarts
+             << ",\n  \"anderson_coefficient_clips\": " << mixer->clippedSteps;
     }
     meta << "\n}\n";
 }

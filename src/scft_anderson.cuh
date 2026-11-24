@@ -83,6 +83,7 @@ struct AndersonMixer {
     int mixedSteps = 0;
     int rejections = 0;
     int restarts = 0;
+    int clippedSteps = 0;
     double norm = 0.0;
 
     AndersonMixer(FTS_Box& box_, PotentialIncompress& pressure_, PotentialFlory& flory_, int history_)
@@ -164,7 +165,13 @@ struct AndersonMixer {
             window.gamma[i] = value / lower[i][i];
             magnitude += std::abs(window.gamma[i]);
         }
-        return std::isfinite(magnitude) && magnitude <= 60.0;
+        if (!std::isfinite(magnitude)) return false;
+        if (magnitude > 60.0) {
+            const double scale = 60.0 / magnitude;
+            for (int i = 0; i < n; ++i) window.gamma[i] *= scale;
+            ++clippedSteps;
+        }
+        return true;
     }
 
     void evaluate(MixWindow window, int next) {
