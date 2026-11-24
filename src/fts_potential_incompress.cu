@@ -9,7 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <thrust/iterator/counting_iterator.h>
-#include <thrust/execution_policy.h>
+#include <thrust/system/cuda/execution_policy.h>
 //#include "globals.h"
 
 void die(const char*);
@@ -111,7 +111,8 @@ void PotentialIncompress::computeForce() {
             force.species[j] = thrust::raw_pointer_cast(mybox->Species[j].d_density.data());
         }
         const auto first = thrust::make_counting_iterator(0);
-        thrust::transform(thrust::device, first, first + mybox->M, d_dHdw.begin(), force);
+        // The predictor snapshot and field update are ordered on this same stream.
+        thrust::transform(thrust::cuda::par_nosync, first, first + mybox->M, d_dHdw.begin(), force);
         return;
     }
     if (d_rho_total.empty()) d_rho_total.resize(mybox->M);

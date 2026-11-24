@@ -4,7 +4,7 @@
 
 #include "fts_species.h"
 #include <thrust/iterator/counting_iterator.h>
-#include <thrust/execution_policy.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 void die(const char*);
 
@@ -115,7 +115,8 @@ void FTS_Species::buildPotentialField() {
         }
         if (supported) {
             const auto first = thrust::make_counting_iterator(0);
-            thrust::transform(thrust::device, first, first + box->M, d_w.begin(), build);
+            // Bond streams wait on the default stream after the field stage.
+            thrust::transform(thrust::cuda::par_nosync, first, first + box->M, d_w.begin(), build);
             return;
         }
     }
