@@ -8,6 +8,9 @@
 #include "fts_species.h"
 #include "fts_potential.h"
 #include "include_libs.h"
+#include "scft_race.h"
+
+#include <cstdlib>
 
 void die(const char*);
 FTS_Molec* FTS_MolecFactory(std::istringstream&, FTS_Box*);
@@ -112,7 +115,11 @@ void FTS_Box::doTimeStep(int step) {
 
 
 void FTS_Box::NVT(int nsteps) {
-
+    if (const char* mode = std::getenv("SCFT_MATILDA_MODE")) {
+        runScftRace(*this, nsteps, mode);
+        writeTime();
+        return;
+    }
 
     for ( int i=0 ; i<nsteps ; i++ ) {
         doTimeStep(i);
