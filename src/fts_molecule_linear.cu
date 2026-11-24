@@ -401,10 +401,8 @@ void LinearMolec::enqueueStreamSweeps() {
 }
 
 void LinearMolec::submitStreamPropagators(bool join, bool exclusive) {
-    if (a.empty()) {
-        a.resize(mybox->M);
-        hf.resize(mybox->M);
-    }
+    a.resize(mybox->M);
+    hf.resize(mybox->M);
     auto& execution = *streamBond;
     if (!execution.plan || (exclusive && !execution.exclusive)) {
         if (execution.graph) requireCuda(cudaGraphExecDestroy(execution.graph));
@@ -639,10 +637,8 @@ void LinearMolec::calcPropagators() {
     if (streamBond) {
         submitStreamPropagators(true, false);
     } else {
-    if (directBond && a.empty()) {
-        a.resize(mybox->M);
-        hf.resize(mybox->M);
-    }
+    a.resize(mybox->M);
+    hf.resize(mybox->M);
     
 
     //////////////////////////////////
