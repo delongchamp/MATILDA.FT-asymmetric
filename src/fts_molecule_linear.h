@@ -6,6 +6,7 @@
 #ifndef _FTS_MOLEC_LINEAR
 #define _FTS_MOLEC_LINEAR
 #include "fts_molecule.h"
+#include <thrust/device_ptr.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <thrust/complex.h>
@@ -13,7 +14,12 @@
 class FTS_Box;
 
 class LinearMolec : public FTS_Molec {
-    protected:
+    private:
+        const bool directBond;
+        const bool foldBondScale;
+
+        void propagateBondStep(thrust::device_ptr<const thrust::complex<double>> previous,
+                               thrust::device_ptr<thrust::complex<double>> next);
 
     public:
         int numBlocks;
@@ -31,7 +37,7 @@ class LinearMolec : public FTS_Molec {
         thrust::device_vector<thrust::complex<double>> d_q;    // [Ntot*M] Chain propagator
         thrust::device_vector<thrust::complex<double>> d_qdag; // [Ntot*M] inverse propagator
 
-        // [M] Fourier transform of bond transition prob
+        // [M] Fourier bond symbol, including 1/M in folded mode
         thrust::device_vector<thrust::complex<double>> d_bond_fft;    
 
         // storage variables

@@ -43,6 +43,9 @@ class Box {
         cufftHandle fftplan, fftplanSingle; // FFT Plans
         void cufftWrapperDouble(const thrust::device_vector<thrust::complex<double>>&,
             thrust::device_vector<thrust::complex<double>>&, const int);
+        // Each buffer contains M device elements. Z2Z also permits identical pointers.
+        void cufftTransformDouble(const thrust::complex<double>* input,
+            thrust::complex<double>* output, int direction, bool normalizeForward);
         void convolveTComplexDouble(thrust::device_vector<thrust::complex<double>>,
             thrust::device_vector<thrust::complex<double>>&, thrust::device_vector<thrust::complex<double>>);
 

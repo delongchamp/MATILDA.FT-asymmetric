@@ -85,24 +85,33 @@ struct NormalizeComplexFFT {
 void Box::cufftWrapperDouble(
     const thrust::device_vector<thrust::complex<double>>& in,
     thrust::device_vector<thrust::complex<double>> &out,
-    const int fftDir)      // fftDir = 1 for forward, -1 for backwards FFT
-    {
+    const int fftDir)
+{
+    cufftTransformDouble(thrust::raw_pointer_cast(in.data()), thrust::raw_pointer_cast(out.data()),
+                        fftDir, true);
+}
 
+void Box::cufftTransformDouble(const thrust::complex<double>* input,
+    thrust::complex<double>* output, int fftDir, bool normalizeForward)
+{
+    static_assert(sizeof(thrust::complex<double>) == sizeof(cufftDoubleComplex));
+    static_assert(alignof(thrust::complex<double>) >= alignof(cufftDoubleComplex));
     int startTime = time(0);
 	
     // cuFFT's complex-to-complex API accepts both out-of-place and in-place buffers.
     // Its input argument is non-const even when the out-of-place transform preserves it.
-    const auto* input = thrust::raw_pointer_cast(in.data());
     auto* _in = reinterpret_cast<cuDoubleComplex*>(
         const_cast<thrust::complex<double>*>(input));
-    auto* _out = reinterpret_cast<cuDoubleComplex*>(thrust::raw_pointer_cast(out.data()));
+    auto* _out = reinterpret_cast<cuDoubleComplex*>(output);
 
     if ( fftDir == 1 ) {
         if (cufftExecZ2Z(fftplan, _in, _out, CUFFT_FORWARD) != CUFFT_SUCCESS) {
             die("cuFFT forward double-complex transform failed");
         }
-        thrust::transform(out.begin(), out.begin() + M, out.begin(),
-                          NormalizeComplexFFT{1.0 / double(M)});
+        if (normalizeForward) {
+            const auto begin = thrust::device_pointer_cast(output);
+            thrust::transform(begin, begin + M, begin, NormalizeComplexFFT{1.0 / double(M)});
+        }
     }
 
     else if ( fftDir == -1 ) {

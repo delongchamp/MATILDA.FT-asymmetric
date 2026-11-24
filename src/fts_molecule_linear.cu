@@ -8,13 +8,25 @@
 #include <thrust/host_vector.h>
 #include <thrust/complex.h>
 #include <thrust/copy.h>
+#include <cstdlib>
+#include <string_view>
 #include "FTS_Box.h"
 #include "fts_species.h"
 void die(const char*);
 
+namespace {
+bool bondOptionEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && std::string_view(value) == "1";
+}
+}
+
 LinearMolec::~LinearMolec(){}
 
-LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Molec(iss, p_box) {
+LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
+    : FTS_Molec(iss, p_box),
+      directBond(bondOptionEnabled("SCFT_MATILDA_BOND_DIRECT")),
+      foldBondScale(bondOptionEnabled("SCFT_MATILDA_BOND_FOLD_SCALE")) {
     // iss comes into this routine having already passed "molecule" and "linear"
     // structure of iss should be:
     // numBlocks, integer
@@ -107,6 +119,7 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Molec(is
 
     // Initialize bond potential
     thrust::host_vector<thrust::complex<double>> bond_fft(mybox->M);
+    const double bondScale = foldBondScale ? 1.0 / double(mybox->M) : 1.0;
 
     double k2, *kv;
     kv = new double[mybox->returnDimension()];
@@ -114,7 +127,7 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Molec(is
         k2 = mybox->get_kD(i, kv);
 
         //bond_fft[i] = exp(-k2/6.0);
-        bond_fft[i] = exp(-k2/(mybox->Nr-1.0));
+        bond_fft[i] = exp(-k2/(mybox->Nr-1.0)) * bondScale;
     }
     delete kv;
 
@@ -124,7 +137,7 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Molec(is
 
     // Allocate temp storage data
     W.resize(mybox->M);
-    qf.resize(mybox->M);
+    if (!directBond) qf.resize(mybox->M);
     hf.resize(mybox->M);
     a.resize(mybox->M);
     expW.resize(mybox->M);
@@ -138,6 +151,29 @@ struct NegExponential {
             return exp(-z);
     }
 };
+
+void LinearMolec::propagateBondStep(thrust::device_ptr<const thrust::complex<double>> previous,
+                                   thrust::device_ptr<thrust::complex<double>> next) {
+    const int extent = mybox->M;
+    auto forwardInput = previous;
+    auto inverseOutput = next;
+    if (!directBond) {
+        thrust::copy(previous, previous + extent, qf.begin());
+        forwardInput = qf.data();
+        inverseOutput = qf.data();
+    }
+
+    mybox->cufftTransformDouble(thrust::raw_pointer_cast(forwardInput),
+                               thrust::raw_pointer_cast(a.data()), 1, !foldBondScale);
+    thrust::transform(d_bond_fft.begin(), d_bond_fft.end(), a.begin(), hf.begin(),
+                      thrust::multiplies<thrust::complex<double>>());
+
+    // In direct mode the inverse writes a disjoint history slice before its in-place site weight.
+    mybox->cufftTransformDouble(thrust::raw_pointer_cast(hf.data()),
+                               thrust::raw_pointer_cast(inverseOutput), -1, false);
+    thrust::transform(inverseOutput, inverseOutput + extent, expW.begin(), next,
+                      thrust::multiplies<thrust::complex<double>>());
+}
 
 void LinearMolec::calcPropagators() {
     
@@ -173,22 +209,8 @@ void LinearMolec::calcPropagators() {
             // Rest of the chain
             else {
 
-                thrust::copy(d_q.begin()+(ind-1)*mybox->M, d_q.begin()+ind*mybox->M, qf.begin());
-
-                // a = FT[ q[ind-1] ]
-                mybox->cufftWrapperDouble(qf, a, 1);            
-
-                // Multiply bond_fft with FT[q(ind-1)]
-                // h = a * d_bond_fft
-                thrust::transform(d_bond_fft.begin(), d_bond_fft.end(), a.begin(), hf.begin(), 
-                    thrust::multiplies<thrust::complex<double>>());
-
-                // qf = IFT[h]
-                mybox->cufftWrapperDouble(hf, qf, -1);
-
-                // d_q = qf * expW
-                thrust::transform(qf.begin(), qf.end(), expW.begin(), d_q.begin()+ind*mybox->M,
-                    thrust::multiplies<thrust::complex<double>>());
+                const auto next = d_q.data() + ind * mybox->M;
+                propagateBondStep(next - mybox->M, next);
 
                 ind += 1;
             } // ind != 0
@@ -233,23 +255,8 @@ void LinearMolec::calcPropagators() {
                 // Rest of the chain
                 else {
                     
-                    // qf = qdag[ind-1][:]
-                    thrust::copy(d_qdag.begin()+(ind-1)*mybox->M, d_qdag.begin()+ind*mybox->M, qf.begin());
-
-                    // a = FT[ qdag[ind-1] ]
-                    mybox->cufftWrapperDouble(qf, a, 1);
-
-                    // Multiply bond_fft with FT[q(ind-1)]
-                    // h = a * d_bond_fft
-                    thrust::transform(d_bond_fft.begin(), d_bond_fft.end(), a.begin(), hf.begin(), 
-                        thrust::multiplies<thrust::complex<double>>());
-
-                    // qf = IFT[h]
-                    mybox->cufftWrapperDouble(hf, qf, -1);
-
-                    // d_q = qf * expW
-                    thrust::transform(qf.begin(), qf.end(), expW.begin(), d_qdag.begin()+ind*mybox->M,
-                        thrust::multiplies<thrust::complex<double>>());
+                    const auto next = d_qdag.data() + ind * mybox->M;
+                    propagateBondStep(next - mybox->M, next);
 
                     ind += 1;
                 }
