@@ -202,6 +202,8 @@ const Complex* deviceData(const DeviceField& field) {
     return thrust::raw_pointer_cast(field.data());
 }
 
+#include "scft_mix_diagnostics.cuh"
+
 void writePartitions(const Path& path, const FTS_Box& box) {
     auto out = openOutput(path);
     out << "{\"single_chain_partition\":[";
@@ -302,6 +304,11 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
                         forcedUpdate % checkEvery || std::to_string(forcedUpdate) != forcePolish)) {
         throw std::runtime_error("Diagnostic FP64 handover requires polish at a common check");
     }
+    std::unique_ptr<MixLagTrace> lagTrace;
+    if (const char* windows = std::getenv("SCFT_MATILDA_MIX_LAG_WINDOWS")) {
+        if (!mixer || mixer->history < 2) throw std::runtime_error("Lag windows require at least two differences");
+        lagTrace = std::make_unique<MixLagTrace>(out, box.M, windows);
+    }
     int polishUpdate = 0;
     for (int step = 0; step < nsteps; ++step) {
         if (mixer) mixer->advance(step);
@@ -370,6 +377,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         } else {
             scftRaceStage("update", updates, box.densityEvaluations);
         }
+        if (lagTrace) lagTrace->record(updates, *mixer, model);
         if ((stopAtNative && native) || (!stopAtNative && converged)) break;
         ++box.totSteps;
     }
