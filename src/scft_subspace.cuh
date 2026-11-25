@@ -549,6 +549,19 @@ class SubspaceExperiment final : public MixIntervention {
         trace << " basis_rank=" << columns << " epsilon=" << stepSize;
         const auto outputs = physicalOutputs(mixer, dirs);
         if (probeDiagnostic) {
+            auto identity = dirs;
+            for (int j = 0; j < dirs.count; ++j) {
+                identity.pressure[j] = parent[2 * j];
+                identity.exchange[j] = parent[2 * j + 1];
+            }
+            assignPhysicalDirections<<<blocks, mixThreads>>>(mixer.fields(), sites, deviceData(complement), identity);
+            storeMixFields<<<blocks, mixThreads>>>(mixer.fields(), sites, mixData(baseRaw));
+            difference<<<(width + mixThreads - 1) / mixThreads, mixThreads>>>(
+                deviceData(baseRaw), deviceData(scratch), mixData(baseRaw), width);
+            const double identityError = std::sqrt(mixDot(deviceData(baseRaw), deviceData(baseRaw), sites));
+            trace << " parent_identity_error=" << identityError;
+            if (!(identityError <= 1e-12 * std::max(1.0, stepSize / 1e-3))) return false;
+            assignPhysicalDirections<<<blocks, mixThreads>>>(mixer.fields(), sites, deviceData(complement), dirs);
             capturePhysicalMaps<<<blocks, mixThreads>>>(residualMaps(mixer.box, model), sites,
                 thrust::raw_pointer_cast(originalClosure.data()), thrust::raw_pointer_cast(originalExchange.data()));
         }
