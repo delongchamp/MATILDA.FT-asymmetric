@@ -212,6 +212,7 @@ const Complex* deviceData(const DeviceField& field) {
 
 #include "scft_mix_diagnostics.cuh"
 #include "scft_subspace.cuh"
+#include "scft_endpoint_diagnostics.cuh"
 
 void writePartitions(const Path& path, const FTS_Box& box) {
     auto out = openOutput(path);
@@ -286,8 +287,10 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     DeviceField lastA = a.d_density, lastB = b.d_density;
     thrust::host_vector<Complex> startA = a.d_w, startB = b.d_w;
     auto trace = openOutput(out / "observer.csv");
-    trace << "updates,field_evals,closure_rms,exchange_rms,drift_rms,canonical_loading_error,"
-             "phi_ps_mean,phi_pmma_mean,min_fraction,max_abs_imag_W,max_abs_imag_phi,check_pass\n";
+    constexpr auto observerHeader = "updates,field_evals,closure_rms,exchange_rms,drift_rms,canonical_loading_error,"
+                                    "phi_ps_mean,phi_pmma_mean,min_fraction,max_abs_imag_W,max_abs_imag_phi,check_pass\n";
+    trace << observerHeader;
+    std::ofstream tailTrace;
     int updates = 0, nativeStop = 0, passing = 0;
     double closure = 0.0, exchange = 0.0, drift = 0.0;
     bool converged = false;
@@ -323,8 +326,87 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         subspace = std::make_unique<SubspaceExperiment>(model, *mixer, out);
     }
     int polishUpdate = 0;
+    const int forcedReset = observeInteger("SCFT_MATILDA_DIAGNOSTIC_RESET_AT");
+    if (forcedReset && (!mixer || forcedReset % checkEvery || forcedReset > nsteps || forcePolish)) {
+        throw std::runtime_error("Diagnostic history reset requires an Anderson common check and no forced handover");
+    }
+    const int timeBudget = observeInteger("SCFT_MATILDA_OBSERVE_BUDGET_S");
+    const int milestone = observeInteger("SCFT_MATILDA_OBSERVE_MILESTONE_S");
+    int nextMilestone = milestone;
+    const int tailUpdates = observeInteger("SCFT_MATILDA_ENDPOINT_TAIL");
+    if (tailUpdates && (!mixer || stopAtNative || tailUpdates % checkEvery || forcePolish || forcedReset)) {
+        throw std::runtime_error("Endpoint continuation requires ordinary Anderson convergence and a multiple of ten");
+    }
+    std::unique_ptr<EndpointPhaseTrace> phaseTrace;
+    if (std::getenv("SCFT_MATILDA_ENDPOINT_PHASE_TRACE")) {
+        if (tailUpdates < 40) throw std::runtime_error("Endpoint phase tracing requires at least 40 tail updates");
+        phaseTrace = std::make_unique<EndpointPhaseTrace>(out, box.M);
+    }
+    int firstPass = 0;
+    bool budgetReached = false;
+    const auto exportResult = [&] {
+        const auto result = cudaDeviceSynchronize();
+        if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+        const double solveSeconds = secondsSince(solveStart);
+        scftRaceStage("host_copy_begin", updates, box.densityEvaluations);
+        const thrust::host_vector<Complex> finalA = a.d_density, finalB = b.d_density;
+        const double timeToFields = secondsSince(processStart);
+        scftRaceStage("fields_ready", updates, box.densityEvaluations);
+        const auto exportStart = Clock::now();
+        writeNpy(out / "phi_ps.npy", box, finalA, scale);
+        writeNpy(out / "phi_pmma.npy", box, finalB, scale);
+        writeNpy(out / "initial_w_ps.npy", box, startA, 1.0, true);
+        writeNpy(out / "initial_w_pmma.npy", box, startB, 1.0, true);
+        writeNpy(out / "w_ps.npy", box, a.d_w, 1.0, true);
+        writeNpy(out / "w_pmma.npy", box, b.d_w, 1.0, true);
+        if (particle) writeNpy(out / "np_fraction.npy", box, particle->d_density, scale);
+        writePartitions(out / "fixed.json", box);
+        scftRaceStage("export_done", updates, box.densityEvaluations);
+        const Path temporary = out / "solver.tmp";
+        auto meta = openOutput(temporary);
+        meta << "{\n  \"revision\": \"" << MY_GIT_VERSION << "\",\n  \"converged\": " <<
+            (converged && !forcePolish && !forcedReset && updates % checkEvery == 0 ? "true" : "false") <<
+            ",\n  \"updates\": " << updates << ",\n  \"field_evals\": " <<
+            box.densityEvaluations << ",\n  \"native_stop_update\": ";
+        if (nativeStop) meta << nativeStop;
+        else meta << "null";
+        meta << ",\n  \"last_common_check_update\": " << updates / checkEvery * checkEvery <<
+            ",\n  \"time_to_fields_s\": " << timeToFields <<
+            ",\n  \"diagnostic_fp64_switch\": " << (forcePolish ? "true" : "false") <<
+            ",\n  \"solve_s\": " << solveSeconds <<
+            ",\n  \"export_s\": " << secondsSince(exportStart);
+        if (updates >= checkEvery && std::isfinite(closure + exchange + drift)) {
+            meta << ",\n  \"closure_rms\": " << closure << ",\n  \"exchange_rms\": " << exchange <<
+                ",\n  \"drift_rms\": " << drift;
+        }
+        if (mixer) {
+            meta << ",\n  \"anderson_history\": " << mixer->history
+                 << ",\n  \"anderson_mixed_steps\": " << mixer->mixedSteps
+                 << ",\n  \"anderson_rejections\": " << mixer->rejections
+                 << ",\n  \"anderson_restarts\": " << mixer->rankRestarts + mixer->rejections
+                 << ",\n  \"anderson_rank_restarts\": " << mixer->rankRestarts
+                 << ",\n  \"anderson_evictions\": " << mixer->evictions
+                 << ",\n  \"anderson_precision_resets\": " << (polishUpdate ? 1 : 0)
+                 << ",\n  \"anderson_coefficient_clips\": " << mixer->clippedSteps;
+            if (mixer->cacheGram) meta << ",\n  \"anderson_gram_reused_entries\": " << mixer->reusedGramEntries;
+            if (mixer->trial != MixTrial::Parent) {
+                meta << ",\n  \"anderson_fit_attempts\": " << mixer->fitAttempts
+                     << ",\n  \"anderson_skipped_fits\": " << mixer->skippedFits
+                     << ",\n  \"anderson_scheduled_resets\": " << mixer->explicitResets
+                     << ",\n  \"anderson_subspace_corrections\": " << mixer->corrections;
+            }
+        }
+        if (polishUpdate) meta << ",\n  \"fp64_bond_from_update\": " << polishUpdate;
+        if (forcedReset) meta << ",\n  \"diagnostic_history_reset_at\": " << forcedReset;
+        if (timeBudget) meta << ",\n  \"observe_budget_s\": " << timeBudget;
+        if (budgetReached) meta << ",\n  \"budget_reached\": true";
+        meta << "\n}\n";
+        meta.close();
+        std::filesystem::rename(temporary, out / "solver.json");
+    };
     for (int step = 0; step < nsteps; ++step) {
-        if (mixer) mixer->advance(step, subspace.get());
+        MixStepOutcome mix;
+        if (mixer) mix = mixer->advance(step, subspace.get());
         else box.doTimeStep(step);
         ++updates;
         const bool native = step >= 50 && !nativeStop && box.converged(step);
@@ -379,7 +461,8 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
                 closure <= maximumClosure && exchange <= maximumExchange && drift <= maximumDrift;
             passing = pass ? passing + 1 : 0;
             converged = passing >= 2;
-            trace << updates << ',' << box.densityEvaluations << ',' <<
+            auto& observer = firstPass ? tailTrace : trace;
+            observer << updates << ',' << box.densityEvaluations << ',' <<
                 closure << ',' << exchange << ',' << drift << ',' << loadingError << ',' <<
                 meanA << ',' << meanB << ',' << sums.minFraction << ',' <<
                 sums.fieldImag << ',' << sums.densityImag << ',' << pass << '\n' << std::flush;
@@ -390,69 +473,52 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         } else {
             scftRaceStage("update", updates, box.densityEvaluations);
         }
+        if (forcedReset == updates) {
+            mixer->resetFromCurrentState();
+            scftRaceStage("diagnostic_history_reset", updates, box.densityEvaluations);
+        }
         if (lagTrace) lagTrace->record(updates, *mixer, model);
-        if ((stopAtNative && native) || (!stopAtNative && converged)) break;
+        if (phaseTrace) phaseTrace->record(box, model, updates, mix);
+        if (updates % checkEvery == 0 && timeBudget && secondsSince(processStart) >= timeBudget) {
+            budgetReached = true;
+        }
+        if (!firstPass && ((stopAtNative && native) || (!stopAtNative && converged))) {
+            if (!tailUpdates) break;
+            firstPass = updates;
+            exportResult();
+            writeDensitySnapshot(out / "first-pass", box, model, updates, closure, exchange, drift, mixer.get());
+            tailTrace = openOutput(out / "diagnostic-observer.csv");
+            tailTrace << observerHeader;
+            if (phaseTrace) phaseTrace->markEndpoint(updates);
+        } else if (firstPass && (updates == firstPass + 50 || updates == firstPass + tailUpdates)) {
+            writeDensitySnapshot(out / ("plus-" + std::to_string(updates - firstPass)), box, model,
+                                 updates, closure, exchange, drift, mixer.get());
+        }
+        if (budgetReached || (firstPass && updates == firstPass + tailUpdates)) break;
+        if (updates % checkEvery == 0 && nextMilestone && secondsSince(processStart) >= nextMilestone) {
+            writeDensitySnapshot(out / "milestones" / std::to_string(nextMilestone), box, model,
+                                 updates, closure, exchange, drift);
+            nextMilestone += milestone;
+        }
         ++box.totSteps;
     }
-    const auto result = cudaDeviceSynchronize();
-    if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
-    const double solveSeconds = secondsSince(solveStart);
-    scftRaceStage("host_copy_begin", updates, box.densityEvaluations);
-    const thrust::host_vector<Complex> finalA = a.d_density, finalB = b.d_density;
-    const double timeToFields = secondsSince(processStart);
-    scftRaceStage("fields_ready", updates, box.densityEvaluations);
-    const auto exportStart = Clock::now();
-    writeNpy(out / "phi_ps.npy", box, finalA, scale);
-    writeNpy(out / "phi_pmma.npy", box, finalB, scale);
-    writeNpy(out / "initial_w_ps.npy", box, startA, 1.0, true);
-    writeNpy(out / "initial_w_pmma.npy", box, startB, 1.0, true);
-    writeNpy(out / "w_ps.npy", box, a.d_w, 1.0, true);
-    writeNpy(out / "w_pmma.npy", box, b.d_w, 1.0, true);
-    if (particle) writeNpy(out / "np_fraction.npy", box, particle->d_density, scale);
-    writePartitions(out / "fixed.json", box);
-    scftRaceStage("export_done", updates, box.densityEvaluations);
-    auto meta = openOutput(out / "solver.json");
-    meta << "{\n  \"revision\": \"" << MY_GIT_VERSION << "\",\n  \"converged\": " <<
-        (converged && !forcePolish && updates % checkEvery == 0 ? "true" : "false") <<
-        ",\n  \"updates\": " << updates << ",\n  \"field_evals\": " <<
-        box.densityEvaluations << ",\n  \"native_stop_update\": ";
-    if (nativeStop) meta << nativeStop;
-    else meta << "null";
-    meta << ",\n  \"last_common_check_update\": " << updates / checkEvery * checkEvery <<
-        ",\n  \"time_to_fields_s\": " << timeToFields <<
-        ",\n  \"diagnostic_fp64_switch\": " << (forcePolish ? "true" : "false") <<
-        ",\n  \"solve_s\": " << solveSeconds <<
-        ",\n  \"export_s\": " << secondsSince(exportStart);
-    if (updates >= checkEvery && std::isfinite(closure + exchange + drift)) {
-        meta << ",\n  \"closure_rms\": " << closure << ",\n  \"exchange_rms\": " << exchange <<
-            ",\n  \"drift_rms\": " << drift;
+    if (!firstPass) {
+        exportResult();
+    } else {
+        auto tail = openOutput(out / "diagnostic-tail.json");
+        tail << "{\"first_pass_update\":" << firstPass << ",\"last_update\":" << updates
+             << ",\"field_evals\":" << box.densityEvaluations << ",\"requested_tail_updates\":" << tailUpdates
+             << ",\"budget_reached\":" << (budgetReached ? "true" : "false")
+             << ",\"seconds\":" << secondsSince(processStart) << "}\n";
     }
-    if (mixer) {
-        meta << ",\n  \"anderson_history\": " << mixer->history
-             << ",\n  \"anderson_mixed_steps\": " << mixer->mixedSteps
-             << ",\n  \"anderson_rejections\": " << mixer->rejections
-             << ",\n  \"anderson_restarts\": " << mixer->rankRestarts + mixer->rejections
-             << ",\n  \"anderson_rank_restarts\": " << mixer->rankRestarts
-             << ",\n  \"anderson_evictions\": " << mixer->evictions
-             << ",\n  \"anderson_precision_resets\": " << (polishUpdate ? 1 : 0)
-             << ",\n  \"anderson_coefficient_clips\": " << mixer->clippedSteps;
-        if (mixer->cacheGram) meta << ",\n  \"anderson_gram_reused_entries\": " << mixer->reusedGramEntries;
-        if (mixer->trial != MixTrial::Parent) {
-            meta << ",\n  \"anderson_fit_attempts\": " << mixer->fitAttempts
-                 << ",\n  \"anderson_skipped_fits\": " << mixer->skippedFits
-                 << ",\n  \"anderson_scheduled_resets\": " << mixer->explicitResets
-                 << ",\n  \"anderson_subspace_corrections\": " << mixer->corrections;
-        }
-    }
-    if (polishUpdate) meta << ",\n  \"fp64_bond_from_update\": " << polishUpdate;
-    meta << "\n}\n";
 }
 }
 
 void scftRaceStage(const char* phase, int updates, int evaluations, std::size_t requestedBytes) {
     static const char* directory = std::getenv("SCFT_RUN_DIR");
-    static const bool enabled = directory && std::getenv("SCFT_MATILDA_STAGES");
-    if (!enabled) return;
+    static const char* setting = std::getenv("SCFT_MATILDA_STAGES");
+    if (!directory || !setting ||
+        (std::string_view(setting) == "checks" && std::string_view(phase) == "update")) return;
     static auto trace = openOutput(Path(directory) / "stages.csv");
     static const bool header = static_cast<bool>(trace <<
         "phase,seconds,updates,evals,cuda_free_bytes,cuda_total_bytes,requested_bytes\n");

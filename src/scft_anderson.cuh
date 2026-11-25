@@ -185,6 +185,16 @@ __global__ void applyMix(MixFields fields, int sites, const Complex* x, const Co
     }
 }
 
+struct MixStepOutcome {
+    bool fitPhase = false;
+    bool eligible = false;
+    bool attempted = false;
+    bool accepted = false;
+    bool rejected = false;
+    bool rankReset = false;
+    bool scheduledReset = false;
+};
+
 struct AndersonMixer {
     FTS_Box& box;
     PotentialIncompress& pressure;
@@ -229,7 +239,8 @@ struct AndersonMixer {
           x(size_t(history + 1) * 3 * box.M), r(x.size()),
           partials(std::max(gramEntryCount(history) * mixPartials, parallelNorm ? parallelNormPartials : 0)),
           pressureWeights(pressureMultiplier(box)) {
-        if (trial != MixTrial::Parent) {
+        const char* requestedTrace = std::getenv("SCFT_MATILDA_MIX_TRACE");
+        if (requestedTrace && std::string_view(requestedTrace) == "1") {
             trialTrace = openOutput(Path(std::getenv("SCFT_RUN_DIR")) / "mix-trial.csv");
             trialTrace << "updates,evals,fp64,eligible,fit_attempted,fit_accepted,raw_rejected,"
                           "scheduled_reset,rank_reset,lambda,next_lambda,prediction,actual,"
@@ -452,7 +463,7 @@ struct AndersonMixer {
         capture(next);
     }
 
-    void advance(int step, MixIntervention* intervention) {
+    MixStepOutcome advance(int step, MixIntervention* intervention) {
         const int slots = history + 1;
         const MixWindow damped{0, {head}, {}};
         auto window = damped;
@@ -463,7 +474,8 @@ struct AndersonMixer {
             ++explicitResets;
         }
         const bool eligible = step >= 8 && retained > 1;
-        const bool fit = eligible && (step - 8) % cadence == 0;
+        const bool fitPhase = step >= 8 && (step - 8) % cadence == 0;
+        const bool fit = eligible && fitPhase;
         bool rankReset = false;
         double coefficientSeconds = 0.0, normSeconds = 0.0;
         const double lambda = agreement.lambda;
@@ -541,6 +553,8 @@ struct AndersonMixer {
         retained = corrected ? 1 : std::min(slots, retained + 1);
         head = next;
         if (step % box.logFreq == 0) box.writeData(step);
+        return {fitPhase, eligible, fit, window.history && !rejected && !corrected, rejected,
+                rankReset, scheduledReset};
     }
 };
 
