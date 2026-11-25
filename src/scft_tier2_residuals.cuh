@@ -7,7 +7,8 @@ void writeSignedNpy(const Path& path, const FTS_Box& box, const thrust::device_v
 
 class Tier2ResidualTrace {
     const Path root;
-    const std::string id;
+    const std::string id, segment;
+    const double affinity;
     const int budget;
     const int limit;
     thrust::device_vector<double> history, closureMap, exchangeMap;
@@ -24,7 +25,7 @@ class Tier2ResidualTrace {
     }
 
     bool captureSample(int update, bool fitPhase) {
-        if (update == 79 || update == 80 || update == 159 || update == 160) return true;
+        if (update == 0 || update == 79 || update == 80 || update == 159 || update == 160) return true;
         if (!lateUpdate && fitPhase && update > 180 &&
             ((budget && secondsSince(processStart) >= budget - 4) || update >= limit - 4)) {
             lateUpdate = update;
@@ -34,7 +35,11 @@ class Tier2ResidualTrace {
 
 public:
     Tier2ResidualTrace(const Path& out, int sites, int budgetSeconds, int nsteps)
-        : root(out / "residual-states"), id(runId()), budget(budgetSeconds), limit(nsteps),
+        : root(out / "residual-states"), id(runId()),
+          segment(std::getenv("SCFT_MATILDA_STAGE") ? std::getenv("SCFT_MATILDA_STAGE") : "target"),
+          affinity(std::getenv("SCFT_MATILDA_AFFINITY_SCALE")
+                    ? std::stod(std::getenv("SCFT_MATILDA_AFFINITY_SCALE")) : 1.0),
+          budget(budgetSeconds), limit(nsteps),
           history(size_t(2) * checkEvery * sites), closureMap(sites), exchangeMap(sites),
           phases(openOutput(out / "residual-phases.csv")) {
         phases << "updates,field_evals,time_s,epoch,precision,phase,fit_attempted,fit_accepted,"
@@ -57,7 +62,8 @@ public:
             PhaseResidualAt{maps, oldA, oldB}, Sums{}, AddSums{});
         const double closure = std::sqrt(sums.pressure / box.M);
         const double exchange = std::sqrt(sums.exchange / sums.weight);
-        const auto phase = switched ? "handover" : mix.fitPhase ? "fit" : mix.eligible ? "plain" : "warmup";
+        const auto phase = update == 0 ? "initial" : switched ? "handover" :
+            mix.fitPhase ? "fit" : mix.eligible ? "plain" : "warmup";
         const auto precision = observedBondsInDouble(box) ? "fp64" : "fp32";
         const double now = secondsSince(processStart);
         const double fit = mixer.pressureWeights.empty() ? mixer.norm : mixer.residualNorm(mixer.head);
@@ -76,10 +82,10 @@ public:
         writeSignedNpy(directory / "closure.npy", box, closureMap);
         writeSignedNpy(directory / "exchange.npy", box, exchangeMap);
         auto meta = openOutput(directory / "sample.json");
-        meta << "{\"run_id\":\"" << id << "\",\"segment\":\"target\",\"update\":" << update
+        meta << "{\"run_id\":\"" << id << "\",\"segment\":\"" << segment << "\",\"update\":" << update
              << ",\"stage_update\":" << update << ",\"field_evals\":" << box.densityEvaluations
              << ",\"state_kind\":\"committed\",\"phase\":\"" << phase << "\",\"precision\":\""
-             << precision << "\",\"wall_s\":" << now << ",\"affinity_scale\":1,\"epoch\":" << epoch
+             << precision << "\",\"wall_s\":" << now << ",\"affinity_scale\":" << affinity << ",\"epoch\":" << epoch
              << ",\"closure_rms\":" << closure << ",\"exchange_rms\":" << exchange << "}\n";
     }
 };

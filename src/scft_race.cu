@@ -252,6 +252,46 @@ void readFrozenField(const Path& path, DeviceField& dest, bool complexField) {
     dest = values;
 }
 
+const std::array<const char*, 3> auxiliaryNames = {"w_pressure", "w_flory_plus", "w_flory_minus"};
+
+std::array<DeviceField*, 3> nativeAuxiliaryFields(FTS_Box& box) {
+    PotentialIncompress* pressure = nullptr;
+    PotentialFlory* flory = nullptr;
+    for (auto* potential : box.Potentials) {
+        if (auto* value = dynamic_cast<PotentialIncompress*>(potential)) pressure = value;
+        if (auto* value = dynamic_cast<PotentialFlory*>(potential)) flory = value;
+    }
+    if (!pressure || !flory) throw std::runtime_error("Missing native auxiliary fields");
+    return {&pressure->d_wpl, &flory->d_wpl, &flory->d_wmi};
+}
+
+void writeAuxiliaries(FTS_Box& box, const Path& out) {
+    const auto fields = nativeAuxiliaryFields(box);
+    std::filesystem::create_directories(out);
+    for (size_t i = 0; i < fields.size(); ++i) {
+        writeNpy(out / (std::string(auxiliaryNames[i]) + ".npy"), box, *fields[i], 1.0, true);
+    }
+}
+
+void targetInput(FTS_Box& box, const char* input) {
+    const auto fields = nativeAuxiliaryFields(box);
+    for (size_t i = 0; i < fields.size(); ++i) {
+        readFrozenField(Path(input) / (std::string(auxiliaryNames[i]) + ".raw"), *fields[i], true);
+    }
+    for (auto& species : box.Species) {
+        species.zeroDensity();
+        species.buildPotentialField();
+    }
+    box.calcMoleculeDensities();
+    scftRaceStage("transferred_density", 0, box.densityEvaluations);
+}
+
+void writeTier2Clock(const Path& out) {
+    if (!std::getenv("SCFT_MATILDA_OUTER_CLOCK")) return;
+    auto clock = openOutput(out / "native-clock.txt");
+    clock << std::chrono::duration<double>(processStart.time_since_epoch()).count() << '\n';
+}
+
 void runFixed(FTS_Box& box, const BinaryModel& model, const Path& out) {
     const char* input = std::getenv("SCFT_MATILDA_FIXED_DIR");
     if (input == nullptr) throw std::runtime_error("Set SCFT_MATILDA_FIXED_DIR");
@@ -286,6 +326,13 @@ void runMask(FTS_Box& box, const Path& out) {
 
 void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int nsteps,
                  bool stopAtNative) {
+    writeTier2Clock(out);
+    if (const char* input = std::getenv("SCFT_MATILDA_AUX_INPUT")) {
+        if (stopAtNative) throw std::runtime_error("An auxiliary transfer requires the observed solver");
+        targetInput(box, input);
+    }
+    const bool prepare = std::getenv("SCFT_MATILDA_PREPARE_STAGE") != nullptr;
+    const bool saveAux = std::getenv("SCFT_MATILDA_AUX_SAVE") != nullptr;
     const auto& a = box.Species[model.a];
     const auto& b = box.Species[model.b];
     const auto* particle = model.np >= 0 ? &box.Species[model.np] : nullptr;
@@ -362,6 +409,16 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     std::unique_ptr<Tier2ResidualTrace> residualTrace;
     if (mixer && std::getenv("SCFT_MATILDA_RESIDUAL_TRACE")) {
         residualTrace = std::make_unique<Tier2ResidualTrace>(out, box.M, timeBudget, nsteps);
+        if (std::getenv("SCFT_MATILDA_STAGE")) residualTrace->record(box, model, *mixer, 0, {}, false);
+    }
+    if (std::getenv("SCFT_MATILDA_STAGE")) {
+        const auto laws = checkProbeState(box, model);
+        auto initial = openOutput(out / "initial-state.json");
+        initial << "{\"field_evals\":" << box.densityEvaluations << ",\"closure_rms\":"
+                << std::sqrt(laws.pressure / box.M) << ",\"exchange_rms\":"
+                << std::sqrt(laws.exchange / laws.weight) / std::max(1.0, std::abs(model.chi))
+                << ",\"accessible_fraction\":" << box.Vfree / box.V
+                << ",\"seconds\":" << secondsSince(processStart) << "}\n";
     }
     int firstPass = 0;
     bool budgetReached = false;
@@ -382,6 +439,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         writeNpy(out / "w_pmma.npy", box, b.d_w, 1.0, true);
         if (particle) writeNpy(out / "np_fraction.npy", box, particle->d_density, scale);
         writePartitions(out / "fixed.json", box);
+        if (saveAux) writeAuxiliaries(box, out / "auxiliary");
         scftRaceStage("export_done", updates, box.densityEvaluations);
         const Path temporary = out / "solver.tmp";
         auto meta = openOutput(temporary);
@@ -481,7 +539,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
             const double loadingError = model.canonical
                 ? std::max(std::abs(meanA - available * model.fractionA),
                            std::abs(meanB - available * model.fractionB)) : 0.0;
-            const bool pass = (!polish || (box.fullPrecisionBonds && !startPolish)) &&
+            const bool pass = !prepare && (!polish || (box.fullPrecisionBonds && !startPolish)) &&
                 std::isfinite(closure + exchange + drift + loadingError) &&
                 loadingError <= 0.002 && sums.minFraction >= -0.005 &&
                 closure <= maximumClosure && exchange <= maximumExchange && drift <= maximumDrift;
@@ -571,10 +629,16 @@ void runScftRace(FTS_Box& box, int nsteps, const char* mode) {
         }
         const BinaryModel model(box);
         if (operation == "fixed") runFixed(box, model, output);
-        else if (operation == "observe" || operation == "native-observe") {
+        else if (operation == "aux-start") {
+            writeTier2Clock(output);
+            writeAuxiliaries(box, output / "auxiliary");
+            auto init = openOutput(output / "aux-start.json");
+            init << "{\"field_evals\":" << box.densityEvaluations << ",\"seconds\":"
+                 << secondsSince(processStart) << ",\"accessible_fraction\":" << box.Vfree / box.V << "}\n";
+        } else if (operation == "observe" || operation == "native-observe") {
             runObserved(box, model, output, nsteps, operation == "native-observe");
         } else {
-            throw std::runtime_error("Select fixed, mask, observe or native-observe");
+            throw std::runtime_error("Select fixed, mask, aux-start, observe or native-observe");
         }
     } catch (const std::exception& error) {
         die(error.what());
