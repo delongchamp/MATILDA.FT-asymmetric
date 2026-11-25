@@ -320,6 +320,16 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
             const bool startPolish = polish && !box.fullPrecisionBonds &&
                 (forcePolish ? updates == forcedUpdate : closure <= 0.004);
             if (startPolish) {
+                if (forcePolish) {
+                    auto fp32 = openOutput(out / "fp32_handover.json");
+                    fp32 << "{\"updates\":" << updates
+                         << ",\"field_evals\":" << box.densityEvaluations
+                         << ",\"closure_rms\":" << closure
+                         << ",\"exchange_rms\":"
+                         << std::sqrt(sums.exchange / sums.weight) / std::max(1.0, std::abs(model.chi))
+                         << ",\"drift_rms\":"
+                         << std::sqrt(std::max(sums.driftA, sums.driftB) / sums.weight) << "}\n";
+                }
                 scftRaceStage("fp64_begin", updates, box.densityEvaluations);
                 box.fullPrecisionBonds = true;
                 polishUpdate = updates;

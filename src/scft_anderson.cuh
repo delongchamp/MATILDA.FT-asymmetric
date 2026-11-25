@@ -1,4 +1,4 @@
-constexpr int maxMixHistory = 8;
+constexpr int maxMixHistory = 10;
 constexpr int mixThreads = 128;
 constexpr int mixPartials = 12;
 
