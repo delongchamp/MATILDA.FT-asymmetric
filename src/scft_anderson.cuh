@@ -546,6 +546,9 @@ struct AndersonMixer {
             }
             trialTrace << ',' << nextNorm << ',';
             if (ridgeEnabled) trialTrace << std::sqrt(agreement.currentSquare);
+            else if (std::getenv("SCFT_MATILDA_RESIDUAL_TRACE")) {
+                trialTrace << (pressureWeights.empty() ? nextNorm : residualNorm(next));
+            }
             trialTrace << ',' << coefficientSeconds << ',' << normSeconds << ',' << corrected << '\n' << std::flush;
         }
         norm = nextNorm;

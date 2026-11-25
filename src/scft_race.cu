@@ -52,9 +52,7 @@ std::ofstream openOutput(const Path& filename) {
     return out;
 }
 
-void writeNpy(const Path& filename, const FTS_Box& box,
-              const thrust::host_vector<Complex>& field, double scale,
-              bool complexValues = false) {
+void writeNpyHeader(std::ofstream& out, const FTS_Box& box, bool complexValues) {
     // NumPy's v1 header uses a little-endian length. The Linux CUDA targets use
     // little-endian IEEE doubles. Reversing Nx preserves the x-fastest layout.
     std::string header = "{'descr': '" + std::string(complexValues ? "<c16" : "<f8") +
@@ -67,9 +65,15 @@ void writeNpy(const Path& filename, const FTS_Box& box,
     header += '\n';
     const char tag[10] = {'\x93', 'N', 'U', 'M', 'P', 'Y', 1, 0,
         static_cast<char>(header.size() & 255), static_cast<char>(header.size() >> 8)};
-    auto out = openOutput(filename);
     out.write(tag, sizeof(tag));
     out.write(header.data(), header.size());
+}
+
+void writeNpy(const Path& filename, const FTS_Box& box,
+              const thrust::host_vector<Complex>& field, double scale,
+              bool complexValues = false) {
+    auto out = openOutput(filename);
+    writeNpyHeader(out, box, complexValues);
     std::vector<double> values;
     values.reserve(field.size() * (complexValues ? 2 : 1));
     for (const auto& value : field) {
@@ -213,6 +217,7 @@ const Complex* deviceData(const DeviceField& field) {
 #include "scft_mix_diagnostics.cuh"
 #include "scft_subspace.cuh"
 #include "scft_endpoint_diagnostics.cuh"
+#include "scft_tier2_residuals.cuh"
 
 void writePartitions(const Path& path, const FTS_Box& box) {
     auto out = openOutput(path);
@@ -349,6 +354,10 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
             throw std::runtime_error("Composition lag must span whole observer intervals and fit within the solve");
         }
         compositionTrace = std::make_unique<CompositionLagTrace>(out, box.M, compositionLag);
+    }
+    std::unique_ptr<Tier2ResidualTrace> residualTrace;
+    if (mixer && std::getenv("SCFT_MATILDA_RESIDUAL_TRACE")) {
+        residualTrace = std::make_unique<Tier2ResidualTrace>(out, box.M, timeBudget, nsteps);
     }
     int firstPass = 0;
     bool budgetReached = false;
@@ -488,6 +497,8 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         }
         if (lagTrace) lagTrace->record(updates, *mixer, model);
         if (phaseTrace) phaseTrace->record(box, model, updates, mix);
+        if (residualTrace) residualTrace->record(box, model, *mixer, updates, mix,
+                                                updates == polishUpdate || updates == forcedReset);
         if (updates % checkEvery == 0 && timeBudget && secondsSince(processStart) >= timeBudget) {
             budgetReached = true;
         }
