@@ -67,6 +67,28 @@ class GmresExperiment final : public MixIntervention {
         return sorted[count / 2] + sorted[(count - 1) / 2];
     }
 
+    void exportTrial(AndersonMixer& mix, int update, const Sums& state, bool accepted) {
+        const char* run = std::getenv("SCFT_RUN_DIR");
+        const char* id = std::getenv("SCFT_MATILDA_RUN_ID");
+        if (!run || !id) throw std::runtime_error("GMRES diagnostics require a residual run ID");
+        const auto directory = Path(run) / "residual-states" / ("trial-u" + std::to_string(update));
+        std::filesystem::create_directories(directory);
+        thrust::device_vector<double> closure(sites), exchange(sites);
+        capturePhysicalMaps<<<blocks, mixThreads>>>(residualMaps(mix.box, model), sites,
+            thrust::raw_pointer_cast(closure.data()), thrust::raw_pointer_cast(exchange.data()));
+        writeSignedNpy(directory / "closure.npy", mix.box, closure);
+        writeSignedNpy(directory / "exchange.npy", mix.box, exchange);
+        auto meta = openOutput(directory / "sample.json");
+        meta << "{\"run_id\":\"" << id << "\",\"segment\":\"target\",\"update\":" << update
+             << ",\"stage_update\":" << update << ",\"field_evals\":" << mix.box.densityEvaluations
+             << ",\"state_kind\":\"trial\",\"phase\":\"plain\",\"precision\":\""
+             << (fp64 ? "fp64" : "fp32") << "\",\"wall_s\":" << secondsSince(processStart)
+             << ",\"affinity_scale\":1,\"event\":\"gmres3_test\",\"accepted\":"
+             << (accepted ? "true" : "false") << ",\"closure_rms\":" << std::sqrt(state.pressure / sites)
+             << ",\"exchange_rms\":" << std::sqrt(state.exchange / state.weight) / std::max(1.0, std::abs(model.chi))
+             << "}\n";
+    }
+
     void probe(AndersonMixer& mix, const Complex* base, double epsilon, int column, DeviceField& result) {
         const ComplexDirection direction{{deviceData(basis[column]), nullptr}, {epsilon, 0}, 1};
         assignMixFields<<<blocks, mixThreads>>>(mix.fields(), sites, base, direction);
@@ -157,12 +179,16 @@ public:
         const double after = normalizedPhysicalSquare(proposal, model, sites);
         const bool accepted = rawAfter < mix.norm && std::isfinite(after) && after <= physical &&
             validProbeState(proposal, model, sites);
+        if (diagnostic && mix.researchAttempts == 0 && validProbeState(proposal, model, sites)) {
+            exportTrial(mix, update, proposal, accepted);
+        }
         if (accepted) mix.capture(next);
         std::ostringstream detail;
         detail << "rank=" << fit.rank << " epsilon=" << epsilon << " model_residual=" << std::abs(fit.rhs[fit.rank])
                << " half_error=" << halfError << " max_orthogonality=" << maxOrtho
                << " cap_scale=" << scale << " raw_before=" << mix.norm << " raw_after=" << rawAfter
                << " physical_before=" << physical << " physical_after=" << after;
+        detail << " candidate_eval=" << mix.box.densityEvaluations;
         return finish(accepted, detail.str());
     }
 

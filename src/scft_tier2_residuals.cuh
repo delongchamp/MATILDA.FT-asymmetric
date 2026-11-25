@@ -10,7 +10,7 @@ class Tier2ResidualTrace {
     const std::string id, segment;
     const double affinity;
     const int budget;
-    const int limit;
+    const int limit, requestedProbe;
     thrust::device_vector<double> history, closureMap, exchangeMap;
     std::ofstream phases;
     int epoch = 0, generationStart = 0, lateUpdate = 0;
@@ -25,6 +25,7 @@ class Tier2ResidualTrace {
     }
 
     bool captureSample(int update, bool fitPhase) {
+        if (requestedProbe && (update == requestedProbe - 1 || update == requestedProbe)) return true;
         if (update == 0 || update == 79 || update == 80 || update == 159 || update == 160) return true;
         if (!lateUpdate && fitPhase && update > 180 &&
             ((budget && secondsSince(processStart) >= budget - 4) || update >= limit - 4)) {
@@ -40,6 +41,7 @@ public:
           affinity(std::getenv("SCFT_MATILDA_AFFINITY_SCALE")
                     ? std::stod(std::getenv("SCFT_MATILDA_AFFINITY_SCALE")) : 1.0),
           budget(budgetSeconds), limit(nsteps),
+          requestedProbe(observeInteger("SCFT_MATILDA_GMRES_FIRST_AT")),
           history(size_t(2) * checkEvery * sites), closureMap(sites), exchangeMap(sites),
           phases(openOutput(out / "residual-phases.csv")) {
         phases << "updates,field_evals,time_s,epoch,precision,phase,fit_attempted,fit_accepted,"
