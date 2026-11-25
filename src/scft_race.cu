@@ -411,6 +411,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
              << ",\n  \"anderson_evictions\": " << mixer->evictions
              << ",\n  \"anderson_precision_resets\": " << (polishUpdate ? 1 : 0)
              << ",\n  \"anderson_coefficient_clips\": " << mixer->clippedSteps;
+        if (mixer->cacheGram) meta << ",\n  \"anderson_gram_reused_entries\": " << mixer->reusedGramEntries;
     }
     if (polishUpdate) meta << ",\n  \"fp64_bond_from_update\": " << polishUpdate;
     meta << "\n}\n";

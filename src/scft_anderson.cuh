@@ -1,6 +1,9 @@
 constexpr int maxMixHistory = 10;
 constexpr int mixThreads = 128;
 constexpr int mixPartials = 12;
+constexpr int parallelNormPartials = 96;
+
+enum class GramLayout { Square, Ordered, Extend };
 
 struct MixFields {
     Complex* field[3];
@@ -38,9 +41,13 @@ struct MixGramEntry {
     int column;
 };
 
-template<bool ordered>
+template<GramLayout layout>
 __host__ __device__ MixGramEntry mixGramEntry(int index, int history) {
-    if constexpr (ordered) {
+    if constexpr (layout == GramLayout::Extend) {
+        if (index < history) return {history - 1, index};
+        return {index - history, history};
+    }
+    if constexpr (layout == GramLayout::Ordered) {
         const int triangle = history * (history + 1) / 2;
         if (index >= triangle) return {index - triangle, history};
         int row = 0;
@@ -51,11 +58,11 @@ __host__ __device__ MixGramEntry mixGramEntry(int index, int history) {
     return {index / dimensions, index % dimensions};
 }
 
-template<bool ordered>
+template<GramLayout layout>
 __global__ void mixGram(const Complex* r, int sites, MixWindow window, double* parts) {
     __shared__ double totals[mixThreads];
     const int width = 3 * sites;
-    const auto [row, column] = mixGramEntry<ordered>(blockIdx.x, window.history);
+    const auto [row, column] = mixGramEntry<layout>(blockIdx.x, window.history);
     double sum = 0.0;
     for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < width; i += blockDim.x * gridDim.y) {
         const Complex a = residualColumn(r, width, i, window, row);
@@ -70,7 +77,7 @@ __global__ void mixGram(const Complex* r, int sites, MixWindow window, double* p
         if (threadIdx.x < stride) totals[threadIdx.x] += totals[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0) parts[blockIdx.x * mixPartials + blockIdx.y] = totals[0] / sites;
+    if (threadIdx.x == 0) parts[blockIdx.x * gridDim.y + blockIdx.y] = totals[0] / sites;
 }
 
 __global__ void applyMix(MixFields fields, int sites, const Complex* x, const Complex* r, MixWindow window) {
@@ -94,8 +101,14 @@ struct AndersonMixer {
     PotentialFlory& flory;
     const int history;
     const bool orderedGram;
+    const bool cacheGram;
+    const bool parallelNorm;
     DeviceField x, r;
     thrust::device_vector<double> partials;
+    using GramMatrix = std::array<double, (maxMixHistory + 1) * (maxMixHistory + 1)>;
+    MixWindow cachedWindow{};
+    GramMatrix cachedMatrix{};
+    int reusedGramEntries = 0;
     int head = 0;
     int retained = 1;
     int mixedSteps = 0;
@@ -106,16 +119,18 @@ struct AndersonMixer {
     double norm = 0.0;
 
     AndersonMixer(FTS_Box& box_, PotentialIncompress& pressure_, PotentialFlory& flory_,
-                  int history_, bool orderedGram_)
+                  int history_, bool orderedGram_, bool cacheGram_, bool parallelNorm_)
         : box(box_), pressure(pressure_), flory(flory_), history(history_), orderedGram(orderedGram_),
+          cacheGram(cacheGram_), parallelNorm(parallelNorm_),
           x(size_t(history + 1) * 3 * box.M), r(x.size()),
-          partials(gramEntryCount(history) * mixPartials) {
+          partials(std::max(gramEntryCount(history) * mixPartials, parallelNorm ? parallelNormPartials : 0)) {
         resetFromCurrentState();
     }
 
     void resetFromCurrentState() {
         head = 0;
         retained = 1;
+        cachedWindow.history = 0;
         capture(0);
         norm = residualNorm(0);
         if (!std::isfinite(norm)) throw std::runtime_error("Nonfinite residual at mixing restart");
@@ -148,17 +163,17 @@ struct AndersonMixer {
         return (differences + 1) * (differences + 1);
     }
 
-    template<bool ordered>
+    template<GramLayout layout>
     void gramWithLayout(MixWindow window, double* result) {
-        const int elements = gramEntryCount(window.history);
+        const int elements = layout == GramLayout::Extend ? 2 * window.history : gramEntryCount(window.history);
         std::array<double, (maxMixHistory + 1) * (maxMixHistory + 1) * mixPartials> host{};
         auto* scratch = thrust::raw_pointer_cast(partials.data());
-        mixGram<ordered><<<dim3(elements, mixPartials), mixThreads>>>(
+        mixGram<layout><<<dim3(elements, mixPartials), mixThreads>>>(
             thrust::raw_pointer_cast(r.data()), box.M, window, scratch);
         checkMixCuda(cudaMemcpy(host.data(), scratch, elements * mixPartials * sizeof(double), cudaMemcpyDeviceToHost));
         for (int element = 0; element < elements; ++element) {
             // Retain the published operand order and host reduction for every consumed entry.
-            const auto [row, column] = mixGramEntry<ordered>(element, window.history);
+            const auto [row, column] = mixGramEntry<layout>(element, window.history);
             double& value = result[row * (window.history + 1) + column];
             value = 0.0;
             for (int i = 0; i < mixPartials; ++i) value += host[element * mixPartials + i];
@@ -166,22 +181,59 @@ struct AndersonMixer {
     }
 
     void gram(MixWindow window, double* result) {
-        if (orderedGram) gramWithLayout<true>(window, result);
-        else gramWithLayout<false>(window, result);
+        if (orderedGram) gramWithLayout<GramLayout::Ordered>(window, result);
+        else gramWithLayout<GramLayout::Square>(window, result);
+    }
+
+    void coefficientGram(MixWindow window, GramMatrix& result) {
+        if (!cacheGram) {
+            gram(window, result.data());
+            return;
+        }
+        const int n = window.history;
+        const int offset = cachedWindow.history - n + 1;
+        // Each coefficient fit is followed by one accepted state. A matching
+        // suffix contains unchanged residual differences, even through wrap.
+        if (n == 1 || (cachedWindow.history > 0 && offset >= 0 &&
+                       std::equal(window.slot, window.slot + n, cachedWindow.slot + offset))) {
+            const int oldWidth = cachedWindow.history + 1;
+            for (int row = 0; row < n - 1; ++row) {
+                for (int column = 0; column <= row; ++column) {
+                    result[row * (n + 1) + column] =
+                        cachedMatrix[(offset + row) * oldWidth + offset + column];
+                }
+            }
+            reusedGramEntries += n * (n - 1) / 2;
+            gramWithLayout<GramLayout::Extend>(window, result.data());
+        } else {
+            gram(window, result.data());
+        }
+        cachedWindow = window;
+        cachedMatrix = result;
     }
 
     double residualNorm(int slot) {
         double square = 0.0;
-        gram(MixWindow{0, {slot}, {}}, &square);
+        const MixWindow window{0, {slot}, {}};
+        if (parallelNorm) {
+            std::array<double, parallelNormPartials> host{};
+            auto* scratch = thrust::raw_pointer_cast(partials.data());
+            mixGram<GramLayout::Ordered><<<dim3(1, parallelNormPartials), mixThreads>>>(
+                thrust::raw_pointer_cast(r.data()), box.M, window, scratch);
+            checkMixCuda(cudaMemcpy(host.data(), scratch, sizeof(host), cudaMemcpyDeviceToHost));
+            for (double part : host) square += part;
+        } else {
+            gram(window, &square);
+        }
         return std::sqrt(square);
     }
 
     bool coefficients(MixWindow& window) {
         const int n = window.history;
         const int width = n + 1;
-        double gramMatrix[(maxMixHistory + 1) * (maxMixHistory + 1)]{};
+        GramMatrix gramMatrix{};
         double lower[maxMixHistory][maxMixHistory]{};
-        gram(window, gramMatrix);
+        coefficientGram(window, gramMatrix);
         double scale = 0.0;
         for (int i = 0; i < n; ++i) scale = std::max(scale, gramMatrix[i * width + i]);
         if (!std::isfinite(scale) || scale == 0) return false;
@@ -239,6 +291,7 @@ struct AndersonMixer {
             if (!coefficients(window)) {
                 window = damped;
                 retained = 1;
+                cachedWindow.history = 0;
                 ++rankRestarts;
             }
         }
@@ -248,6 +301,7 @@ struct AndersonMixer {
         if (window.history && (!std::isfinite(nextNorm) || nextNorm > 1.35 * norm)) {
             ++rejections;
             retained = 1;
+            cachedWindow.history = 0;
             evaluate(damped, next);
             nextNorm = residualNorm(next);
         } else if (window.history) {
@@ -293,6 +347,13 @@ std::unique_ptr<AndersonMixer> createAnderson(FTS_Box& box, const BinaryModel& m
     std::cout << "Single-evaluation controller, Anderson history " << history << '\n';
     const char* backend = std::getenv("SCFT_MATILDA_MIX_GRAM");
     const bool orderedGram = backend && std::string_view(backend) == "ordered";
+    const char* reuse = std::getenv("SCFT_MATILDA_MIX_CACHE");
+    const bool cacheGram = reuse && std::string_view(reuse) == "1";
+    const char* normMode = std::getenv("SCFT_MATILDA_MIX_NORM");
+    const bool parallelNorm = normMode && std::string_view(normMode) == "parallel";
+    if (cacheGram && !orderedGram) throw std::runtime_error("Incremental Gram requires the ordered backend");
     std::cout << "Anderson Gram backend " << (orderedGram ? "ordered" : "original") << std::endl;
-    return std::make_unique<AndersonMixer>(box, *pressure, *flory, history, orderedGram);
+    if (cacheGram) std::cout << "Anderson Gram cache enabled\n";
+    if (parallelNorm) std::cout << "Anderson norm uses 96 partials\n";
+    return std::make_unique<AndersonMixer>(box, *pressure, *flory, history, orderedGram, cacheGram, parallelNorm);
 }
