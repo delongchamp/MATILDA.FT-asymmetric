@@ -217,6 +217,7 @@ struct AndersonMixer {
     int corrections = 0;
     RidgeAgreement agreement;
     std::ofstream trialTrace;
+    std::ofstream fitOracle;
     double norm = 0.0;
 
     AndersonMixer(FTS_Box& box_, PotentialIncompress& pressure_, PotentialFlory& flory_,
@@ -233,6 +234,9 @@ struct AndersonMixer {
             trialTrace << "updates,evals,fp64,eligible,fit_attempted,fit_accepted,raw_rejected,"
                           "scheduled_reset,rank_reset,lambda,next_lambda,prediction,actual,"
                           "raw_norm,fitted_norm,coefficient_s,fit_norm_s,subspace_accepted\n";
+        }
+        if (ridgeEnabled && verifyCache) {
+            fitOracle = openOutput(Path(std::getenv("SCFT_RUN_DIR")) / "ridge-oracle.log");
         }
         resetFromCurrentState();
     }
@@ -424,6 +428,15 @@ struct AndersonMixer {
                         gramMatrix[i * width + j] * window.gamma[i] * window.gamma[j];
                 }
             }
+            if (fitOracle.is_open()) {
+                fitOracle << n << ' ' << agreement.lambda << ' ' << agreement.currentSquare << ' '
+                          << agreement.prediction;
+                for (int i = 0; i < n; ++i) {
+                    for (int j = 0; j <= i; ++j) fitOracle << ' ' << gramMatrix[i * width + j];
+                    fitOracle << ' ' << gramMatrix[i * width + n] << ' ' << window.gamma[i];
+                }
+                fitOracle << '\n';
+            }
         }
         return true;
     }
@@ -505,7 +518,7 @@ struct AndersonMixer {
             agreement.currentSquare = nextSquare;
         }
         if (trialTrace.is_open()) {
-            trialTrace << step + 1 << ',' << box.densityEvaluations << ',' << box.fullPrecisionBonds << ','
+            trialTrace << step + 1 << ',' << box.densityEvaluations << ',' << observedBondsInDouble(box) << ','
                        << eligible << ',' << fit << ',' << (window.history && !rejected && !corrected) << ',' << rejected << ','
                        << scheduledReset << ',' << rankReset << ',';
             if (ridgeEnabled) {

@@ -147,6 +147,14 @@ struct BinaryModel {
     }
 };
 
+bool observedBondsInDouble(const FTS_Box& box) {
+    static const bool startsMixed = [] {
+        const char* mode = std::getenv("SCFT_MATILDA_FP32_BOND");
+        return mode && (std::string_view(mode) == "polish" || std::string_view(mode) == "1");
+    }();
+    return !startsMixed || box.fullPrecisionBonds;
+}
+
 #include "scft_anderson.cuh"
 
 struct Sums {
@@ -377,7 +385,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
                 sums.fieldImag << ',' << sums.densityImag << ',' << pass << '\n' << std::flush;
             lastA = a.d_density;
             lastB = b.d_density;
-            scftRaceStage(box.fullPrecisionBonds ? "fp64_check" : "initial_precision_check",
+            scftRaceStage(observedBondsInDouble(box) ? "fp64_check" : "initial_precision_check",
                           updates, box.densityEvaluations);
         } else {
             scftRaceStage("update", updates, box.densityEvaluations);

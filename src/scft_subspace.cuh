@@ -117,9 +117,9 @@ struct ObservationWindow {
 
     void record(AndersonMixer& mixer, DeviceField& scratch, bool keepVectors) {
         const int restarts = mixer.rejections + mixer.rankRestarts + mixer.explicitResets;
-        if (epoch != restarts || fp64 != mixer.box.fullPrecisionBonds) count = 0;
+        if (epoch != restarts || fp64 != observedBondsInDouble(mixer.box)) count = 0;
         epoch = restarts;
-        fp64 = mixer.box.fullPrecisionBonds;
+        fp64 = observedBondsInDouble(mixer.box);
         if (mixer.retained < 2 || count == observationSize) return;
         const int sites = mixer.box.M, width = 3 * sites;
         const int old = (mixer.head + mixer.history) % (mixer.history + 1);
@@ -237,11 +237,12 @@ __global__ void assignPhysicalDirections(MixFields fields, int sites, const Comp
     fields.field[2][i] = base[2 * sites + i] + Complex(exchange, 0.0);
 }
 
-__global__ void captureClosure(PhysicalResidual maps, int sites, double* closure) {
+__global__ void capturePhysicalMaps(PhysicalResidual maps, int sites, double* closure, double* exchange) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < sites) {
-        double exchange, pore;
-        maps(i, closure[i], exchange, pore);
+        double e, pore;
+        maps(i, closure[i], e, pore);
+        if (exchange) exchange[i] = e;
     }
 }
 
@@ -312,6 +313,37 @@ struct PhysicalProjectionAt {
     }
 };
 
+struct PhysicalLeakageAt {
+    PhysicalResidual maps;
+    const double* previous;
+    const double* first;
+    const double* second;
+    bool exchange;
+
+    __host__ __device__ LagProducts operator()(int i) const {
+        double c, e, pore;
+        maps(i, c, e, pore);
+        const double v = (exchange ? e : c) - previous[i];
+        const double weight = exchange ? pore : 1.0;
+        return {weight * v * v, weight * v * first[i], second ? weight * v * second[i] : 0.0};
+    }
+};
+
+struct PatternOverlapAt {
+    PhysicalResidual maps;
+    const double* first;
+    const double* second;
+    bool exchange;
+
+    __host__ __device__ LagProducts operator()(int i) const {
+        double c, e, pore;
+        maps(i, c, e, pore);
+        const double a = first[i], b = second ? second[i] : 0.0;
+        const double weight = exchange ? pore : 1.0;
+        return {weight * a * b, weight * a * a, weight * b * b};
+    }
+};
+
 struct ProposedProjectionAt {
     const Complex* before;
     const Complex* after;
@@ -357,7 +389,7 @@ class SubspaceExperiment final : public MixIntervention {
     std::array<DeviceField, 2> u, ju;
     DeviceField complement, signsA, signsB;
     std::array<thrust::device_vector<double>, 2> patterns;
-    thrust::device_vector<double> originalClosure;
+    thrust::device_vector<double> originalClosure, originalExchange;
     std::ofstream trace;
 
     double epsilon(const Complex* base) const {
@@ -432,6 +464,23 @@ class SubspaceExperiment final : public MixIntervention {
         return output;
     }
 
+    double responseLeakage(AndersonMixer& mixer, const PhysicalDirections& dirs, bool exchange) const {
+        const auto maps = residualMaps(mixer.box, model);
+        const auto* previous = thrust::raw_pointer_cast((exchange ? originalExchange : originalClosure).data());
+        const auto values = reduceLag(sites, PhysicalLeakageAt{
+            maps, previous, dirs.modes[0], dirs.modes[1], exchange});
+        const auto gram = reduceLag(sites, PatternOverlapAt{
+            maps, dirs.modes[0], dirs.modes[1], exchange});
+        if (!(values.dot > 0 && gram.current > 0)) return 0.0;
+        double retained = values.current * values.current / gram.current;
+        if (dirs.count == 2) {
+            const double independent = gram.past - gram.dot * gram.dot / gram.current;
+            const double projection = values.past - gram.dot * values.current / gram.current;
+            if (independent > 1e-12 * gram.past) retained += projection * projection / independent;
+        }
+        return std::sqrt(std::max(0.0, 1 - retained / values.dot));
+    }
+
     void setPhysicalFields(AndersonMixer& mixer, PhysicalDirections dirs, bool density) {
         assignPhysicalDirections<<<blocks, mixThreads>>>(mixer.fields(), sites, deviceData(complement), dirs);
         if (density) rebuildDensity(mixer);
@@ -481,7 +530,7 @@ class SubspaceExperiment final : public MixIntervention {
         prepareComplement();
         if (requestedRank == 4) {
             auto* reference = thrust::raw_pointer_cast(originalClosure.data());
-            captureClosure<<<blocks, mixThreads>>>(residualMaps(mixer.box, model), sites, reference);
+            capturePhysicalMaps<<<blocks, mixThreads>>>(residualMaps(mixer.box, model), sites, reference, nullptr);
             auto pressureProbe = dirs;
             pressureProbe.pressure[0] = stepSize;
             setPhysicalFields(mixer, pressureProbe, true);
@@ -499,6 +548,10 @@ class SubspaceExperiment final : public MixIntervention {
         const int columns = 2 * dirs.count;
         trace << " basis_rank=" << columns << " epsilon=" << stepSize;
         const auto outputs = physicalOutputs(mixer, dirs);
+        if (probeDiagnostic) {
+            capturePhysicalMaps<<<blocks, mixThreads>>>(residualMaps(mixer.box, model), sites,
+                thrust::raw_pointer_cast(originalClosure.data()), thrust::raw_pointer_cast(originalExchange.data()));
+        }
         SmallMatrix jacobian{}, measured{};
         for (int j = 0; j < columns; ++j) {
             const int mode = j / 2;
@@ -518,6 +571,8 @@ class SubspaceExperiment final : public MixIntervention {
                 trace << " J" << i << j << '=' << measured[i][j];
             }
             if (probeDiagnostic) {
+                trace << " closure_leakage=" << responseLeakage(mixer, dirs, false)
+                      << " exchange_leakage=" << responseLeakage(mixer, dirs, true);
                 (j % 2 ? probe.exchange[mode] : probe.pressure[mode]) = stepSize / 2;
                 setPhysicalFields(mixer, probe, true);
                 const auto half = physicalOutputs(mixer, dirs);
@@ -597,8 +652,9 @@ public:
             patterns[0].resize(sites);
             if (requestedRank == 4) {
                 patterns[1].resize(sites);
-                originalClosure.resize(sites);
             }
+            if (requestedRank == 4 || probeDiagnostic) originalClosure.resize(sites);
+            if (probeDiagnostic) originalExchange.resize(sites);
         }
         trace << "requested_rank=" << requestedRank << " projected=" << projected << " diagonal=" << diagonal
               << " diagnostic=" << probeDiagnostic << '\n' << std::flush;
@@ -615,7 +671,7 @@ public:
         const auto start = Clock::now();
         const auto evals = mixer.box.densityEvaluations;
         const auto* base = deviceData(mixer.x) + size_t(mixer.head) * width;
-        trace << "update=" << update << " nominal=" << nominal << " fp64=" << mixer.box.fullPrecisionBonds
+        trace << "update=" << update << " nominal=" << nominal << " fp64=" << observedBondsInDouble(mixer.box)
               << " cap=" << history.cap();
         if (projected) storeRaw<<<blocks, mixThreads>>>(mixer.fields(), sites, mixData(baseRaw));
         const bool accepted = projected ? examineProjection(mixer, base, next)
