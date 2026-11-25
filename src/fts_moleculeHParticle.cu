@@ -278,15 +278,21 @@ std::complex<double> ParticleMolec::calcHTerm() {
     d_multiplyDoubleCpxByCpxByCpxScalar<<<mybox->M_Grid, mybox->M_Block>>>(mybox->d_cpxGabe,
         _d_wpl, _d_nprho, negativeI, mybox->M);
 
-    cuDoubleComplex *htp;
-    htp = (cuDoubleComplex*) malloc(mybox->M * sizeof(cuDoubleComplex));
+    const std::size_t bytes = std::size_t(mybox->M) * sizeof(cuDoubleComplex);
+    auto* hostProduct = static_cast<cuDoubleComplex*>(std::malloc(bytes));
+    if (!hostProduct) die("Could not allocate particle Hamiltonian buffer");
 
-    cudaMemcpy(htp, mybox->d_cpxGabe, mybox->M*sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+    const auto status = cudaMemcpy(hostProduct, mybox->d_cpxGabe, bytes, cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+        std::free(hostProduct);
+        die(cudaGetErrorString(status));
+    }
     
     Hterm = 0.0;
     for ( int i=0 ; i<mybox->M ; i++ ) {
-        Hterm += std::complex<double>(htp[i].x, htp[i].y);
+        Hterm += std::complex<double>(hostProduct[i].x, hostProduct[i].y);
     }
+    std::free(hostProduct);
 
     //Hterm = mybox->sumCpxDoubleDeviceArray(mybox->d_cpxGabe, mybox->blockSize, mybox->M );
 
