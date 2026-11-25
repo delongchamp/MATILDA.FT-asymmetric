@@ -64,8 +64,7 @@ void checkMixCuda(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 
-thrust::device_vector<double> pressureMultiplier(FTS_Box& box) {
-    const char* option = std::getenv("SCFT_MATILDA_MIX_PRESSURE_CAP");
+thrust::device_vector<double> pressureMultiplier(FTS_Box& box, const char* option) {
     if (!option) return {};
     char* end = nullptr;
     const double cap = std::strtod(option, &end);
@@ -185,6 +184,8 @@ __global__ void applyMix(MixFields fields, int sites, const Complex* x, const Co
     }
 }
 
+#include "scft_tier2_mixer.cuh"
+
 struct MixStepOutcome {
     bool fitPhase = false;
     bool eligible = false;
@@ -209,7 +210,12 @@ struct AndersonMixer {
     const bool verifyCache = std::getenv("SCFT_MATILDA_MIX_VERIFY_CACHE") != nullptr;
     DeviceField x, r;
     thrust::device_vector<double> partials;
-    thrust::device_vector<double> pressureWeights;
+    const ResearchMethod method;
+    thrust::device_vector<double> pressureWeights, accessibility;
+    DeviceField pressureScratch;
+    std::ofstream researchTrace;
+    int researchAttempts = 0, researchAccepted = 0, researchExtraEvals = 0;
+    bool bbReady = false;
     using GramMatrix = std::array<double, (maxMixHistory + 1) * (maxMixHistory + 1)>;
     MixWindow cachedWindow{};
     GramMatrix cachedMatrix{};
@@ -231,14 +237,30 @@ struct AndersonMixer {
     double norm = 0.0;
 
     AndersonMixer(FTS_Box& box_, PotentialIncompress& pressure_, PotentialFlory& flory_,
-                  int history_, bool orderedGram_, bool cacheGram_, bool parallelNorm_, MixTrial trial_)
+                  int history_, bool orderedGram_, bool cacheGram_, bool parallelNorm_, MixTrial trial_,
+                  ResearchMethod method_, int particle)
         : box(box_), pressure(pressure_), flory(flory_), history(history_), orderedGram(orderedGram_),
           cacheGram(cacheGram_), parallelNorm(parallelNorm_),
           trial(trial_), cadence(trial == MixTrial::Period4 ? 4 : trial == MixTrial::Period2 ? 2 : 1),
           ridgeEnabled(trial == MixTrial::RidgeFixed || trial == MixTrial::RidgeAdaptive),
           x(size_t(history + 1) * 3 * box.M), r(x.size()),
           partials(std::max(gramEntryCount(history) * mixPartials, parallelNorm ? parallelNormPartials : 0)),
-          pressureWeights(pressureMultiplier(box)) {
+          method(method_), pressureWeights(pressureMultiplier(box, pressureCap(method))) {
+        if (method == ResearchMethod::MaskedPressure) {
+            if (particle < 0) throw std::runtime_error("Masked pressure needs an NP field");
+            accessibility.resize(box.M);
+            pressureScratch.resize(box.M);
+            pressureAccessibility<<<blocks(), mixThreads>>>(
+                thrust::raw_pointer_cast(box.Species[particle].d_density.data()), 1.0 / (box.C * box.Nr),
+                thrust::raw_pointer_cast(accessibility.data()), box.M);
+            const double inverseSites = 1.0 / box.M;
+            offsetPressureSymbol<<<blocks(), mixThreads>>>(
+                thrust::raw_pointer_cast(pressureWeights.data()), inverseSites, box.M);
+        }
+        if (method != ResearchMethod::Direct && std::getenv("SCFT_MATILDA_RESIDUAL_TRACE")) {
+            researchTrace = openOutput(Path(std::getenv("SCFT_RUN_DIR")) / "method-events.csv");
+            researchTrace << "update,seconds,event,attempted,accepted,extra_evals,detail\n";
+        }
         const char* requestedTrace = std::getenv("SCFT_MATILDA_MIX_TRACE");
         if (requestedTrace && std::string_view(requestedTrace) == "1") {
             trialTrace = openOutput(Path(std::getenv("SCFT_RUN_DIR")) / "mix-trial.csv");
@@ -252,7 +274,25 @@ struct AndersonMixer {
         resetFromCurrentState();
     }
 
+    static const char* pressureCap(ResearchMethod choice) {
+        const char* native = std::getenv("SCFT_MATILDA_MIX_PRESSURE_CAP");
+        if (choice == ResearchMethod::MaskedPressure) return "1.5";
+        if (choice == ResearchMethod::OtherPressure) return native ? nullptr : "1.5";
+        return native;
+    }
+
+    void researchEvent(int update, const char* event, bool accepted, int extra, const std::string& detail) {
+        ++researchAttempts;
+        researchAccepted += accepted;
+        researchExtraEvals += extra;
+        if (researchTrace.is_open()) {
+            researchTrace << update << ',' << secondsSince(processStart) << ',' << event << ",1,"
+                          << accepted << ',' << extra << ',' << detail << '\n' << std::flush;
+        }
+    }
+
     void resetFromCurrentState() {
+        bbReady = false;
         head = 0;
         retained = 1;
         cachedWindow.history = 0;
@@ -284,6 +324,22 @@ struct AndersonMixer {
         // The current residual is raw through the growth test. Only accepted
         // states enter the preconditioned fit and update.
         auto* values = thrust::raw_pointer_cast(r.data()) + size_t(slot) * 3 * box.M;
+        if (method == ResearchMethod::MaskedPressure) {
+            auto* scratch = thrust::raw_pointer_cast(pressureScratch.data());
+            const auto* weight = thrust::raw_pointer_cast(accessibility.data());
+            const auto first = thrust::device_pointer_cast(values);
+            const auto delta = pressureScratch.begin();
+            const double sites = box.M;
+            const Complex mean = thrust::reduce(thrust::device, first, first + box.M, Complex{}) / sites;
+            pressureWindow<<<blocks(), mixThreads>>>(scratch, values, weight, mean, box.M);
+            box.cufftTransformDouble(scratch, scratch, 1, false);
+            multiplyPressure<<<blocks(), mixThreads>>>(scratch, thrust::raw_pointer_cast(pressureWeights.data()), box.M);
+            box.cufftTransformDouble(scratch, scratch, -1, false);
+            pressureWindow<<<blocks(), mixThreads>>>(scratch, scratch, weight, Complex{}, box.M);
+            const Complex center = thrust::reduce(thrust::device, delta, delta + box.M, Complex{}) / sites;
+            applyPressureCorrection<<<blocks(), mixThreads>>>(values, scratch, center, box.M);
+            return;
+        }
         box.cufftTransformDouble(values, values, 1, false);
         multiplyPressure<<<blocks(), mixThreads>>>(
             values, thrust::raw_pointer_cast(pressureWeights.data()), box.M);
@@ -452,9 +508,30 @@ struct AndersonMixer {
         return true;
     }
 
-    void evaluate(MixWindow window, int next) {
-        applyMix<<<blocks(), mixThreads>>>(fields(), box.M,
-            thrust::raw_pointer_cast(x.data()), thrust::raw_pointer_cast(r.data()), window);
+    double spectralGain(int slots) const {
+        const int width = 3 * box.M;
+        const size_t current = size_t(head) * width;
+        const size_t prior = size_t((head + slots - 1) % slots) * width;
+        const auto first = thrust::make_counting_iterator(0);
+        const auto products = thrust::transform_reduce(thrust::device, first, first + width,
+            SecantAt{thrust::raw_pointer_cast(x.data() + current), thrust::raw_pointer_cast(x.data() + prior),
+                     thrust::raw_pointer_cast(r.data() + current), thrust::raw_pointer_cast(r.data() + prior),
+                     box.M}, SecantProducts{}, AddSecant{});
+        if (!std::isfinite(products.ss + products.yy + products.sy) ||
+            products.ss <= 0 || products.yy <= 0 ||
+            products.sy <= 1e-10 * std::sqrt(products.ss) * std::sqrt(products.yy)) return 1.0;
+        return std::clamp(products.ss / products.sy, 0.5, 2.0);
+    }
+
+    void evaluate(MixWindow window, int next, double gain = 1.0) {
+        if (gain == 1.0) {
+            applyMix<<<blocks(), mixThreads>>>(fields(), box.M,
+                thrust::raw_pointer_cast(x.data()), thrust::raw_pointer_cast(r.data()), window);
+        } else {
+            const size_t offset = size_t(window.slot[0]) * 3 * box.M;
+            applyScaledPlain<<<blocks(), mixThreads>>>(fields(), box.M,
+                thrust::raw_pointer_cast(x.data() + offset), thrust::raw_pointer_cast(r.data() + offset), gain);
+        }
         for (auto& species : box.Species) {
             species.zeroDensity();
             species.buildPotentialField();
@@ -501,9 +578,17 @@ struct AndersonMixer {
         }
         const int next = (head + 1) % slots;
         const bool corrected = intervention && intervention->attempt(*this, window, step + 1, next);
-        if (!corrected) evaluate(window, next);
+        const bool spectral = method == ResearchMethod::BB1 && bbReady && eligible && !fitPhase;
+        const double gain = spectral ? spectralGain(slots) : 1.0;
+        if (!corrected) evaluate(window, next, gain);
         double nextNorm = residualNorm(next);
-        const bool rejected = !corrected && window.history && (!std::isfinite(nextNorm) || nextNorm > 1.35 * norm);
+        const bool rejected = !corrected && (window.history || gain != 1.0) &&
+            (!std::isfinite(nextNorm) || nextNorm > 1.35 * norm);
+        if (spectral) {
+            researchEvent(step + 1, "bb1", !rejected && gain != 1.0, rejected,
+                          "alpha=" + std::to_string(gain));
+        }
+        bbReady = !rankReset && !rejected && !corrected;
         if (corrected) {
             ++corrections;
             cachedWindow.history = 0;
@@ -518,6 +603,11 @@ struct AndersonMixer {
         }
         if (!std::isfinite(nextNorm)) throw std::runtime_error("Nonfinite damped mixing residual");
         preconditionAcceptedPressure(next);
+        if (method == ResearchMethod::MaskedPressure || method == ResearchMethod::OtherPressure) {
+            researchEvent(step + 1, "pressure", true, 0,
+                          method == ResearchMethod::MaskedPressure ? "masked" :
+                          pressureWeights.empty() ? "identity" : "uniform");
+        }
         if (ridgeEnabled) {
             const auto begin = Clock::now();
             const double fitted = pressureWeights.empty() ? nextNorm : residualNorm(next);
@@ -603,5 +693,12 @@ std::unique_ptr<AndersonMixer> createAnderson(FTS_Box& box, const BinaryModel& m
     if (parallelNorm) std::cout << "Anderson norm uses 96 partials\n";
     const char* experiment = std::getenv("SCFT_MATILDA_MIX_TRIAL");
     std::cout << "Anderson experiment " << (experiment ? experiment : "parent") << std::endl;
-    return std::make_unique<AndersonMixer>(box, *pressure, *flory, history, orderedGram, cacheGram, parallelNorm, trial);
+    const auto method = requestedResearchMethod();
+    if (method != ResearchMethod::Direct && trial != MixTrial::Period2) {
+        throw std::runtime_error("Research methods require the period-two Anderson controller");
+    }
+    const char* research = std::getenv("SCFT_MATILDA_RESEARCH_METHOD");
+    std::cout << "SCFT research method " << (research ? research : "direct") << std::endl;
+    return std::make_unique<AndersonMixer>(box, *pressure, *flory, history, orderedGram, cacheGram,
+                                           parallelNorm, trial, method, model.np);
 }

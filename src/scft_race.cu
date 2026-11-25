@@ -13,6 +13,7 @@
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform_reduce.h>
+#include <thrust/reduce.h>
 
 #include <algorithm>
 #include <array>
@@ -406,6 +407,11 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
                  << ",\n  \"anderson_precision_resets\": " << (polishUpdate ? 1 : 0)
                  << ",\n  \"anderson_coefficient_clips\": " << mixer->clippedSteps;
             if (mixer->cacheGram) meta << ",\n  \"anderson_gram_reused_entries\": " << mixer->reusedGramEntries;
+            if (mixer->method != ResearchMethod::Direct) {
+                meta << ",\n  \"research_attempts\": " << mixer->researchAttempts
+                     << ",\n  \"research_accepted\": " << mixer->researchAccepted
+                     << ",\n  \"research_extra_evals\": " << mixer->researchExtraEvals;
+            }
             if (mixer->trial != MixTrial::Parent) {
                 meta << ",\n  \"anderson_fit_attempts\": " << mixer->fitAttempts
                      << ",\n  \"anderson_skipped_fits\": " << mixer->skippedFits
