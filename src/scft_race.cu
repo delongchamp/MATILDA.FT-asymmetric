@@ -342,6 +342,14 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         if (tailUpdates < 40) throw std::runtime_error("Endpoint phase tracing requires at least 40 tail updates");
         phaseTrace = std::make_unique<EndpointPhaseTrace>(out, box.M);
     }
+    const int compositionLag = observeInteger("SCFT_MATILDA_OBSERVE_COMPOSITION_LAG");
+    std::unique_ptr<CompositionLagTrace> compositionTrace;
+    if (compositionLag) {
+        if (compositionLag % checkEvery || compositionLag >= nsteps) {
+            throw std::runtime_error("Composition lag must span whole observer intervals and fit within the solve");
+        }
+        compositionTrace = std::make_unique<CompositionLagTrace>(out, box.M, compositionLag);
+    }
     int firstPass = 0;
     bool budgetReached = false;
     const auto exportResult = [&] {
@@ -466,6 +474,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
                 closure << ',' << exchange << ',' << drift << ',' << loadingError << ',' <<
                 meanA << ',' << meanB << ',' << sums.minFraction << ',' <<
                 sums.fieldImag << ',' << sums.densityImag << ',' << pass << '\n' << std::flush;
+            if (compositionTrace) compositionTrace->record(box, model, updates, sums.weight, pass);
             lastA = a.d_density;
             lastB = b.d_density;
             scftRaceStage(observedBondsInDouble(box) ? "fp64_check" : "initial_precision_check",
@@ -490,7 +499,8 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
             tailTrace = openOutput(out / "diagnostic-observer.csv");
             tailTrace << observerHeader;
             if (phaseTrace) phaseTrace->markEndpoint(updates);
-        } else if (firstPass && (updates == firstPass + 50 || updates == firstPass + tailUpdates)) {
+        } else if (firstPass && (updates == firstPass + 50 || updates == firstPass + 200 ||
+                                 updates == firstPass + tailUpdates)) {
             writeDensitySnapshot(out / ("plus-" + std::to_string(updates - firstPass)), box, model,
                                  updates, closure, exchange, drift, mixer.get());
         }

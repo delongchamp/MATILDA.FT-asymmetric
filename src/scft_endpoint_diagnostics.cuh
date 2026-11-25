@@ -81,6 +81,60 @@ public:
     }
 };
 
+__device__ double localComposition(const PhysicalResidual& maps, int i) {
+    const double a = maps.a[i].real() * maps.densityScale;
+    const double b = maps.b[i].real() * maps.densityScale;
+    return b / fmax(a + b, 1e-12);
+}
+
+struct CompositionChangeAt {
+    PhysicalResidual maps;
+    const double* previous;
+
+    __device__ double operator()(int i) const {
+        const double mask = maps.mask ? maps.mask[i].real() * maps.densityScale : 0.0;
+        const double weight = fmin(fmax(1.0 - mask, 0.0), 1.0);
+        const double delta = localComposition(maps, i) - previous[i];
+        return weight >= 0.1 ? weight * delta * delta : 0.0;
+    }
+};
+
+__global__ void saveComposition(PhysicalResidual maps, int sites, double* values) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < sites) values[i] = localComposition(maps, i);
+}
+
+class CompositionLagTrace {
+    const int lagChecks;
+    thrust::device_vector<double> history;
+    std::vector<bool> fp64History;
+    std::ofstream stream;
+
+public:
+    CompositionLagTrace(const Path& out, int sites, int lag)
+        : lagChecks(lag / checkEvery), history(size_t(lagChecks) * sites), fp64History(lagChecks),
+          stream(openOutput(out / "composition-lag.csv")) {
+        stream << "updates,from_update,fp64,from_fp64,pore_composition_rms,native_check_pass\n";
+    }
+
+    void record(const FTS_Box& box, const BinaryModel& model, int update, double poreWeight, bool pass) {
+        const int sites = box.M;
+        const int slot = (update / checkEvery) % lagChecks;
+        auto* previous = thrust::raw_pointer_cast(history.data()) + size_t(slot) * sites;
+        const bool fp64 = observedBondsInDouble(box);
+        const auto maps = residualMaps(box, model);
+        if (update > lagChecks * checkEvery) {
+            const auto first = thrust::make_counting_iterator(0);
+            const double square = thrust::transform_reduce(thrust::device, first, first + sites,
+                CompositionChangeAt{maps, previous}, 0.0, thrust::plus<double>{});
+            stream << update << ',' << update - lagChecks * checkEvery << ',' << fp64 << ','
+                   << fp64History[slot] << ',' << std::sqrt(square / poreWeight) << ',' << pass << '\n';
+        }
+        saveComposition<<<(sites + mixThreads - 1) / mixThreads, mixThreads>>>(maps, sites, previous);
+        fp64History[slot] = fp64;
+    }
+};
+
 int observeInteger(const char* name) {
     const char* setting = std::getenv(name);
     if (!setting) return 0;
