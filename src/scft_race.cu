@@ -631,8 +631,8 @@ void runScftRace(FTS_Box& box, int nsteps, const char* mode) {
         if (operation == "fixed") runFixed(box, model, output);
         else if (operation == "aux-start") {
             writeTier2Clock(output);
-            writeAuxiliaries(box, output / "auxiliary");
-            auto init = openOutput(output / "aux-start.json");
+            writeAuxiliaries(box, Path(output) / "auxiliary");
+            auto init = openOutput(Path(output) / "aux-start.json");
             init << "{\"field_evals\":" << box.densityEvaluations << ",\"seconds\":"
                  << secondsSince(processStart) << ",\"accessible_fraction\":" << box.Vfree / box.V << "}\n";
         } else if (operation == "observe" || operation == "native-observe") {
