@@ -21,6 +21,53 @@ void checkMixCuda(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 
+thrust::device_vector<double> pressureMultiplier(FTS_Box& box) {
+    const char* option = std::getenv("SCFT_MATILDA_MIX_PRESSURE_CAP");
+    if (!option) return {};
+    char* end = nullptr;
+    const double cap = std::strtod(option, &end);
+    if (end == option || *end || !std::isfinite(cap) || cap < 1.0 || cap > 4.0) {
+        throw std::runtime_error("Anderson pressure multiplier requires a cap from 1 to 4");
+    }
+    if (cap == 1.0) return {};
+    std::vector<const LinearMolec*> chains;
+    double zeroResponse = 0.0;
+    for (const auto* molecule : box.Molecs) {
+        if (molecule->molec_type == "HParticle") continue;
+        const auto* chain = dynamic_cast<const LinearMolec*>(molecule);
+        if (!chain || chain->doSmear || chain->Ntot < 1 || chain->activity > 0 || chain->phi <= 0) {
+            throw std::runtime_error("Pressure response requires canonical, unsmeared linear chains");
+        }
+        chains.push_back(chain);
+        zeroResponse += chain->phi * chain->Ntot;
+    }
+    if (chains.empty() || box.Nr <= 1) throw std::runtime_error("Missing pressure response model");
+    const double inverseSites = 1.0 / box.M;
+    thrust::host_vector<double> multiplier(box.M, inverseSites);
+    std::vector<double> wavevector(box.returnDimension());
+    for (int i = 1; i < box.M; ++i) {
+        const double bond = std::exp(-box.get_kD(i, wavevector.data()) / (box.Nr - 1.0));
+        double response = 0.0;
+        for (const auto* chain : chains) {
+            const int sites = chain->Ntot;
+            double sum = sites;
+            double power = bond;
+            for (int distance = 1; distance < sites; ++distance, power *= bond) {
+                sum += 2 * (sites - distance) * power;
+            }
+            response += chain->phi * sum / sites;
+        }
+        multiplier[i] = inverseSites * std::clamp(zeroResponse / response, 1.0, cap);
+    }
+    std::cout << "Anderson pressure response cap " << cap << ", uniform multiplier 1\n";
+    return thrust::device_vector<double>(multiplier);
+}
+
+__global__ void multiplyPressure(Complex* values, const double* multiplier, int sites) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < sites) values[i] *= multiplier[i];
+}
+
 __global__ void captureMixState(MixFields fields, int sites, Complex* x, Complex* r) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= sites) return;
@@ -105,6 +152,7 @@ struct AndersonMixer {
     const bool parallelNorm;
     DeviceField x, r;
     thrust::device_vector<double> partials;
+    thrust::device_vector<double> pressureWeights;
     using GramMatrix = std::array<double, (maxMixHistory + 1) * (maxMixHistory + 1)>;
     MixWindow cachedWindow{};
     GramMatrix cachedMatrix{};
@@ -123,7 +171,8 @@ struct AndersonMixer {
         : box(box_), pressure(pressure_), flory(flory_), history(history_), orderedGram(orderedGram_),
           cacheGram(cacheGram_), parallelNorm(parallelNorm_),
           x(size_t(history + 1) * 3 * box.M), r(x.size()),
-          partials(std::max(gramEntryCount(history) * mixPartials, parallelNorm ? parallelNormPartials : 0)) {
+          partials(std::max(gramEntryCount(history) * mixPartials, parallelNorm ? parallelNormPartials : 0)),
+          pressureWeights(pressureMultiplier(box)) {
         resetFromCurrentState();
     }
 
@@ -134,6 +183,7 @@ struct AndersonMixer {
         capture(0);
         norm = residualNorm(0);
         if (!std::isfinite(norm)) throw std::runtime_error("Nonfinite residual at mixing restart");
+        preconditionAcceptedPressure(0);
     }
 
     MixFields fields() const {
@@ -147,6 +197,17 @@ struct AndersonMixer {
     }
 
     int blocks() const { return (box.M + mixThreads - 1) / mixThreads; }
+
+    void preconditionAcceptedPressure(int slot) {
+        if (pressureWeights.empty()) return;
+        // The current residual is raw through the growth test. Only accepted
+        // states enter the preconditioned fit and update.
+        auto* values = thrust::raw_pointer_cast(r.data()) + size_t(slot) * 3 * box.M;
+        box.cufftTransformDouble(values, values, 1, false);
+        multiplyPressure<<<blocks(), mixThreads>>>(
+            values, thrust::raw_pointer_cast(pressureWeights.data()), box.M);
+        box.cufftTransformDouble(values, values, -1, false);
+    }
 
     void capture(int slot) {
         pressure.computeForce();
@@ -308,6 +369,7 @@ struct AndersonMixer {
             ++mixedSteps;
         }
         if (!std::isfinite(nextNorm)) throw std::runtime_error("Nonfinite damped mixing residual");
+        preconditionAcceptedPressure(next);
         norm = nextNorm;
         if (history && retained == slots) ++evictions;
         retained = std::min(slots, retained + 1);
