@@ -11,6 +11,7 @@ struct AndersonMixer;
 struct MixWindow;
 struct MixIntervention {
     virtual bool attempt(AndersonMixer& mixer, MixWindow window, int update, int next) = 0;
+    virtual void committed(AndersonMixer&, int, bool) {}
     virtual ~MixIntervention() = default;
 };
 
@@ -185,6 +186,7 @@ __global__ void applyMix(MixFields fields, int sites, const Complex* x, const Co
 }
 
 #include "scft_tier2_mixer.cuh"
+#include "scft_tier2_regional.cuh"
 
 struct MixStepOutcome {
     bool fitPhase = false;
@@ -213,6 +215,10 @@ struct AndersonMixer {
     const ResearchMethod method;
     thrust::device_vector<double> pressureWeights, accessibility;
     DeviceField pressureScratch;
+    thrust::device_vector<double> nearWall;
+    double nearWeight = 0;
+    bool regionalApplied = false;
+    std::string regionalDetail;
     std::ofstream researchTrace;
     int researchAttempts = 0, researchAccepted = 0, researchExtraEvals = 0;
     bool bbReady = false;
@@ -256,6 +262,24 @@ struct AndersonMixer {
             const double inverseSites = 1.0 / box.M;
             offsetPressureSymbol<<<blocks(), mixThreads>>>(
                 thrust::raw_pointer_cast(pressureWeights.data()), inverseSites, box.M);
+        }
+        if (method == ResearchMethod::Regional) {
+            const char* path = std::getenv("SCFT_MATILDA_REGIONAL_WALL");
+            if (!path || !orderedGram) throw std::runtime_error("Regional fitting needs a registered wall and ordered Gram");
+            std::ifstream stream(path, std::ios::binary);
+            thrust::host_vector<double> weights(box.M);
+            if (!stream.read(reinterpret_cast<char*>(weights.data()), box.M * sizeof(double)) ||
+                stream.peek() != std::ifstream::traits_type::eof()) {
+                throw std::runtime_error("Regional wall field has incorrect size");
+            }
+            for (auto& weight : weights) {
+                if (!std::isfinite(weight)) throw std::runtime_error("Nonfinite wall distance");
+                const double t = std::clamp((weight - 0.4) / 2.0, 0.0, 1.0);
+                weight = 1 - t * t * (3 - 2 * t);
+                nearWeight += weight;
+            }
+            nearWall = weights;
+            pressureScratch.resize(box.M);
         }
         if (method != ResearchMethod::Direct && std::getenv("SCFT_MATILDA_RESIDUAL_TRACE")) {
             researchTrace = openOutput(Path(std::getenv("SCFT_RUN_DIR")) / "method-events.csv");
@@ -448,12 +472,10 @@ struct AndersonMixer {
         return std::sqrt(square);
     }
 
-    bool coefficients(MixWindow& window) {
+    bool solveCoefficients(MixWindow& window, const GramMatrix& gramMatrix, bool native) {
         const int n = window.history;
         const int width = n + 1;
-        GramMatrix gramMatrix{};
         double lower[maxMixHistory][maxMixHistory]{};
-        coefficientGram(window, gramMatrix);
         double scale = 0.0;
         for (int i = 0; i < n; ++i) scale = std::max(scale, gramMatrix[i * width + i]);
         if (!std::isfinite(scale) || scale == 0) return false;
@@ -484,7 +506,7 @@ struct AndersonMixer {
         if (magnitude > 60.0) {
             const double scale = 60.0 / magnitude;
             for (int i = 0; i < n; ++i) window.gamma[i] *= scale;
-            ++clippedSteps;
+            if (native) ++clippedSteps;
         }
         if (ridgeEnabled) {
             agreement.prediction = 0.0;
@@ -508,6 +530,56 @@ struct AndersonMixer {
         return true;
     }
 
+    bool coefficients(MixWindow& window) {
+        GramMatrix matrix{};
+        coefficientGram(window, matrix);
+        return solveCoefficients(window, matrix, true);
+    }
+
+    bool regionalCoefficients(MixWindow& window, bool near) {
+        const double totalWeight = near ? nearWeight : box.M - nearWeight;
+        if (totalWeight <= 1e-10 * box.M) return false;
+        const int n = window.history, elements = gramEntryCount(n);
+        auto* parts = thrust::raw_pointer_cast(partials.data());
+        regionalGram<<<dim3(elements, mixPartials), mixThreads>>>(
+            thrust::raw_pointer_cast(r.data()), box.M, window,
+            thrust::raw_pointer_cast(nearWall.data()), near, totalWeight, parts);
+        std::array<double, (maxMixHistory + 1) * (maxMixHistory + 1) * mixPartials> host{};
+        checkMixCuda(cudaMemcpy(host.data(), parts, elements * mixPartials * sizeof(double), cudaMemcpyDeviceToHost));
+        GramMatrix matrix{};
+        for (int j = 0; j < elements; ++j) {
+            const auto [row, col] = mixGramEntry<GramLayout::Ordered>(j, n);
+            for (int i = 0; i < mixPartials; ++i) matrix[row * (n + 1) + col] += host[j * mixPartials + i];
+        }
+        return solveCoefficients(window, matrix, false);
+    }
+
+    bool evaluateRegional(MixWindow global) {
+        if (method != ResearchMethod::Regional || !global.history) return false;
+        auto near = global, far = global;
+        const bool nearFit = regionalCoefficients(near, true), farFit = regionalCoefficients(far, false);
+        if (!nearFit) near = global;
+        if (!farFit) far = global;
+        double delta = 0;
+        for (int i = 0; i < global.history; ++i) {
+            delta += std::abs(near.gamma[i] - global.gamma[i]) + std::abs(far.gamma[i] - global.gamma[i]);
+        }
+        if (researchTrace.is_open()) {
+            std::ostringstream detail;
+            detail << "near=" << nearFit << " far=" << farFit << " near_weight=" << nearWeight
+                   << " coefficient_l1_delta=" << delta;
+            regionalDetail = detail.str();
+        }
+        if (delta == 0) return false;
+        applyRegionalMix<<<blocks(), mixThreads>>>(fields(), box.M, thrust::raw_pointer_cast(x.data()),
+            thrust::raw_pointer_cast(r.data()), global, near, far,
+            thrust::raw_pointer_cast(nearWall.data()), thrust::raw_pointer_cast(pressureScratch.data()));
+        const auto mean = thrust::reduce(thrust::device, pressureScratch.begin(), pressureScratch.end(), Complex{}) /
+            static_cast<double>(box.M);
+        centerRegionalPressure<<<blocks(), mixThreads>>>(fields().field[0], box.M, mean);
+        return true;
+    }
+
     double spectralGain(int slots) const {
         const int width = 3 * box.M;
         const size_t current = size_t(head) * width;
@@ -525,7 +597,8 @@ struct AndersonMixer {
 
     void evaluate(MixWindow window, int next, double gain = 1.0) {
         if (gain == 1.0) {
-            applyMix<<<blocks(), mixThreads>>>(fields(), box.M,
+            regionalApplied = evaluateRegional(window);
+            if (!regionalApplied) applyMix<<<blocks(), mixThreads>>>(fields(), box.M,
                 thrust::raw_pointer_cast(x.data()), thrust::raw_pointer_cast(r.data()), window);
         } else {
             const size_t offset = size_t(window.slot[0]) * 3 * box.M;
@@ -588,6 +661,10 @@ struct AndersonMixer {
             researchEvent(step + 1, "bb1", !rejected && gain != 1.0, rejected,
                           "alpha=" + std::to_string(gain));
         }
+        if (method == ResearchMethod::Regional && fit) {
+            researchEvent(step + 1, "regional", regionalApplied && !rejected, rejected,
+                          rankReset ? "global_rank_reset" : regionalDetail);
+        }
         bbReady = !rankReset && !rejected && !corrected;
         if (corrected) {
             ++corrections;
@@ -642,6 +719,7 @@ struct AndersonMixer {
             trialTrace << ',' << coefficientSeconds << ',' << normSeconds << ',' << corrected << '\n' << std::flush;
         }
         norm = nextNorm;
+        if (intervention) intervention->committed(*this, next, corrected);
         if (history && retained == slots) ++evictions;
         retained = corrected ? 1 : std::min(slots, retained + 1);
         head = next;

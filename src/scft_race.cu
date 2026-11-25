@@ -219,6 +219,7 @@ const Complex* deviceData(const DeviceField& field) {
 #include "scft_subspace.cuh"
 #include "scft_endpoint_diagnostics.cuh"
 #include "scft_tier2_residuals.cuh"
+#include "scft_tier2_gmres.cuh"
 
 void writePartitions(const Path& path, const FTS_Box& box) {
     auto out = openOutput(path);
@@ -327,9 +328,11 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         if (!mixer || mixer->history < 2) throw std::runtime_error("Lag windows require at least two differences");
         lagTrace = std::make_unique<MixLagTrace>(out, box.M, windows);
     }
-    std::unique_ptr<SubspaceExperiment> subspace;
+    std::unique_ptr<MixIntervention> intervention;
     if (mixer && mixer->trial >= MixTrial::Rpm1) {
-        subspace = std::make_unique<SubspaceExperiment>(model, *mixer, out);
+        intervention = std::make_unique<SubspaceExperiment>(model, *mixer, out);
+    } else if (mixer && mixer->method == ResearchMethod::GMRES) {
+        intervention = std::make_unique<GmresExperiment>(model, *mixer);
     }
     int polishUpdate = 0;
     const int forcedReset = observeInteger("SCFT_MATILDA_DIAGNOSTIC_RESET_AT");
@@ -429,7 +432,7 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     };
     for (int step = 0; step < nsteps; ++step) {
         MixStepOutcome mix;
-        if (mixer) mix = mixer->advance(step, subspace.get());
+        if (mixer) mix = mixer->advance(step, intervention.get());
         else box.doTimeStep(step);
         ++updates;
         const bool native = step >= 50 && !nativeStop && box.converged(step);
