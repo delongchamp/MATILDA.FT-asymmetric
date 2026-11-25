@@ -215,15 +215,17 @@ void writePartitions(const Path& path, const FTS_Box& box) {
     out << "]}\n";
 }
 
-void readFrozenField(const Path& path, DeviceField& dest) {
+void readFrozenField(const Path& path, DeviceField& dest, bool complexField) {
     std::ifstream in(path, std::ios::binary);
     thrust::host_vector<Complex> values(dest.size());
     for (auto& value : values) {
-        double real = 0.0;
-        if (!in.read(reinterpret_cast<char*>(&real), sizeof(real)) || !std::isfinite(real)) {
+        double real = 0.0, imaginary = 0.0;
+        if (!in.read(reinterpret_cast<char*>(&real), sizeof(real)) || !std::isfinite(real)
+            || (complexField && (!in.read(reinterpret_cast<char*>(&imaginary), sizeof(imaginary))
+                                || !std::isfinite(imaginary)))) {
             throw std::runtime_error("Invalid frozen per-site field " + path.string());
         }
-        value = real;
+        value = Complex(real, imaginary);
     }
     if (in.peek() != std::ifstream::traits_type::eof()) {
         throw std::runtime_error("Unexpected trailing data in " + path.string());
@@ -237,8 +239,10 @@ void runFixed(FTS_Box& box, const BinaryModel& model, const Path& out) {
     const Path root(input);
     auto& a = box.Species[model.a];
     auto& b = box.Species[model.b];
-    readFrozenField(root / "w_ps.raw", a.d_w);
-    readFrozenField(root / "w_pmma.raw", b.d_w);
+    const char* complex = std::getenv("SCFT_MATILDA_FIXED_COMPLEX");
+    const bool complexFields = complex && std::string_view(complex) == "1";
+    readFrozenField(root / "w_ps.raw", a.d_w, complexFields);
+    readFrozenField(root / "w_pmma.raw", b.d_w, complexFields);
     for (auto& species : box.Species) species.zeroDensity();
     box.calcMoleculeDensities();
     const double scale = 1.0 / (box.C * box.Nr);
