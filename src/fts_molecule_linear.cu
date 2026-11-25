@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string_view>
 #include "FTS_Box.h"
+#include "scft_race.h"
 #include "fts_species.h"
 void die(const char*);
 
@@ -77,6 +78,8 @@ struct StreamBondPlan {
                 requireFft(cufftMakePlan3d(fft, box.Nx[2], box.Nx[1], box.Nx[0], CUFFT_Z2Z, &workspaceBytes));
             }
             requireFft(cufftSetStream(fft, stream));
+            scftRaceStage(type == CUFFT_C2C ? "bond_c2c_workspace" : "bond_z2z_workspace",
+                          0, box.densityEvaluations, workspaceBytes);
             std::cout << "Stream bond cuFFT workspace bytes " << workspaceBytes << std::endl;
         } catch (...) {
             release();
@@ -269,8 +272,13 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
         }
     }
     shareReverse = isSymmetric && optionEnabled("SCFT_MATILDA_SHARE_REVERSE");
-    d_q.resize(Ntot * mybox->M);
-    if (!shareReverse) d_qdag.resize(d_q.size());
+    const std::size_t contourSites = std::size_t(Ntot) * mybox->M;
+    scftRaceStage("contour_allocate", 0, 0, contourSites * sizeof(Complex));
+    d_q.resize(contourSites);
+    if (!shareReverse) {
+        scftRaceStage("reverse_contour_allocate", 0, 0, contourSites * sizeof(Complex));
+        d_qdag.resize(contourSites);
+    }
 
     // Determine integer block Species
     for ( int j=0 ; j<numBlocks; j++ ) {
@@ -291,6 +299,7 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
 
 
     // Initialize bond potential
+    scftRaceStage("bond_symbol_begin");
     thrust::host_vector<thrust::complex<double>> bond_fft(mybox->M);
     const double bondScale = foldBondScale ? 1.0 / double(mybox->M) : 1.0;
 
@@ -306,6 +315,7 @@ LinearMolec::LinearMolec(std::istringstream& iss, FTS_Box* p_box)
 
     // Send bond potential to device
     d_bond_fft = bond_fft;
+    scftRaceStage("bond_symbol_done");
 
 
     // Allocate temp storage data
@@ -561,9 +571,16 @@ bool LinearMolec::calcPairedDensity(LinearMolec& other, bool batch, bool streams
         const char* mode = std::getenv("SCFT_MATILDA_FP32_BOND");
         const bool mixed = !mybox->fullPrecisionBonds && mode
             && (std::string_view(mode) == "1" || std::string_view(mode) == "polish");
-        if (batchedBond && batchedBond->mixed != mixed) batchedBond.reset();
+        if (batchedBond && batchedBond->mixed != mixed) {
+            scftRaceStage("bond_plan_destroy_begin", 0, mybox->densityEvaluations);
+            batchedBond.reset();
+            scftRaceStage("bond_plan_destroyed", 0, mybox->densityEvaluations);
+        }
         if (!batchedBond) {
+            scftRaceStage("batch_allocate", 0, mybox->densityEvaluations,
+                          4 * std::size_t(mybox->M) * (mixed ? sizeof(cufftComplex) : sizeof(Complex)));
             batchedBond = std::make_unique<BatchedBondExecution>(*mybox, mixed);
+            scftRaceStage("batch_ready", 0, mybox->densityEvaluations);
             std::cout << (mixed ? "C2C FP32" : "Z2Z FP64") << " batch-two bond plan, "
                       << 2 * size_t(mybox->M) * (mixed ? sizeof(cufftComplex) : sizeof(Complex)) * 2
                       << " frontier and spectrum bytes" << std::endl;

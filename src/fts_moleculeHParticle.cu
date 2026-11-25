@@ -9,11 +9,17 @@
 #include <thrust/complex.h>
 #include <thrust/copy.h>
 #include "FTS_Box.h"
+#include "scft_race.h"
 #include "fts_species.h"
 #include "fts_potential.h"
+#include <chrono>
+#include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <iostream>
+#include "scft_particle_tiles.cuh"
+
 void die(const char*);
 
 ParticleMolec::~ParticleMolec(){}
@@ -131,33 +137,45 @@ ParticleMolec::ParticleMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Mole
     phiNP = Vnptot / mybox->V;
     
     
-    thrust::fill(d_NPdensity.begin(), d_NPdensity.end(), 0.0);
-    thrust::fill(density.begin(), density.end(), 0.0);
-    // Loop over particles
-    for (int j = 0; j < particleNum; j++ ) {
+    const auto renderStart = std::chrono::steady_clock::now();
+    const char* renderer = std::getenv("SCFT_MATILDA_PARTICLE_RENDERER");
+    const bool tiled = renderer && std::string(renderer) == "tiles";
+    scftRaceStage("particle_render_begin");
+    if (tiled) {
+        renderParticleTiles(*mybox, *this);
+    } else {
+        thrust::fill(d_NPdensity.begin(), d_NPdensity.end(), 0.0);
+        thrust::fill(density.begin(), density.end(), 0.0);
+        // Loop over particles
+        for (int j = 0; j < particleNum; j++ ) {
 
-        // Loop over grid points
-        for (int i=0; i < mybox->M; i++) {
-            double r[mybox->returnDimension()];
-            mybox->get_r(i, r); // gives position in each direction based on grid point
-            double mdr2 = 0;
-            double dr_abs;
-            double dr[mybox->returnDimension()];
-            // Loop over dimensions
-            for (int k = 0; k < mybox->returnDimension(); k++) {
-                //calculate distance from NP center
-                dr[k] = center[(3*j)+k] - r[k];
-                //take into account periodic boundaries
-                if (dr[k] >= 0.5 * mybox-> L[k]) dr[k] -= mybox->L[k];
-                else if (dr[k] < -0.5 * mybox -> L[k]) dr[k] += mybox->L[k];
-                mdr2 += dr[k] * dr[k]; 
+            // Loop over grid points
+            for (int i=0; i < mybox->M; i++) {
+                double r[mybox->returnDimension()];
+                mybox->get_r(i, r); // gives position in each direction based on grid point
+                double mdr2 = 0;
+                double dr_abs;
+                double dr[mybox->returnDimension()];
+                // Loop over dimensions
+                for (int k = 0; k < mybox->returnDimension(); k++) {
+                    //calculate distance from NP center
+                    dr[k] = center[(3*j)+k] - r[k];
+                    //take into account periodic boundaries
+                    if (dr[k] >= 0.5 * mybox-> L[k]) dr[k] -= mybox->L[k];
+                    else if (dr[k] < -0.5 * mybox -> L[k]) dr[k] += mybox->L[k];
+                    mdr2 += dr[k] * dr[k];
+                }
+                dr_abs = sqrt(mdr2);
+                // density[i] += mybox->Nr * mybox->rho0 * 0.5 * erfc( ( dr_abs-Rp[j] ) / xi[j] );
+                density[i] += mybox->Nr * mybox->C * 0.5 * erfc( ( dr_abs-Rp[j] ) / xi[j] );
+
             }
-            dr_abs = sqrt(mdr2);
-            // density[i] += mybox->Nr * mybox->rho0 * 0.5 * erfc( ( dr_abs-Rp[j] ) / xi[j] );    
-			density[i] += mybox->Nr * mybox->C * 0.5 * erfc( ( dr_abs-Rp[j] ) / xi[j] );    
-            
         }
     }
+    std::cout << "Particle renderer " << (tiled ? "tiles" : "legacy") << " seconds "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - renderStart).count()
+              << std::endl;
+    scftRaceStage("particle_render_done");
     double gvol = 1.0;
     for ( int j=0 ; j<mybox->returnDimension() ; j++ ) {
         gvol *= mybox->L[j] / double(mybox->Nx[j]);
@@ -182,7 +200,7 @@ ParticleMolec::ParticleMolec(std::istringstream& iss, FTS_Box* p_box) : FTS_Mole
 
 
     //transfer density to device
-    d_NPdensity = density;
+    if (!tiled) d_NPdensity = density;
     if (mybox->fieldAssembly >= 2) d_density = d_NPdensity;
     int is = intSpecies[0];
 

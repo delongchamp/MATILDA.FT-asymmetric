@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #include <iomanip>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 void die(const char*);
@@ -245,12 +247,27 @@ void runFixed(FTS_Box& box, const BinaryModel& model, const Path& out) {
     writePartitions(out / "fixed.json", box);
 }
 
+void runMask(FTS_Box& box, const Path& out) {
+    const auto particle = std::find_if(box.Species.begin(), box.Species.end(),
+        [](const auto& species) { return species.fts_species == "NP"; });
+    if (particle == box.Species.end() || box.C <= 0 || box.Nr <= 0) {
+        throw std::runtime_error("Mask export requires a normalized NP species");
+    }
+    const thrust::host_vector<Complex> mask = particle->d_density;
+    const double timeToMask = secondsSince(processStart);
+    writeNpy(out / "np_fraction.npy", box, mask, 1.0 / (box.C * box.Nr));
+    auto meta = openOutput(out / "mask.json");
+    meta << "{\"native_sites\":" << box.M << ",\"accessible_fraction\":" << box.Vfree / box.V
+         << ",\"time_to_mask_s\":" << timeToMask << "}\n";
+}
+
 void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int nsteps,
                  bool stopAtNative) {
     const auto& a = box.Species[model.a];
     const auto& b = box.Species[model.b];
     const auto* particle = model.np >= 0 ? &box.Species[model.np] : nullptr;
     const double scale = 1.0 / (box.C * box.Nr);
+    scftRaceStage("observer_snapshots_begin", 0, box.densityEvaluations);
     DeviceField lastA = a.d_density, lastB = b.d_density;
     thrust::host_vector<Complex> startA = a.d_w, startB = b.d_w;
     auto trace = openOutput(out / "observer.csv");
@@ -260,9 +277,27 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     double closure = 0.0, exchange = 0.0, drift = 0.0;
     bool converged = false;
     const auto solveStart = Clock::now();
+    const char* requested = std::getenv("SCFT_MATILDA_ANDERSON");
+    const bool requireMixer = std::getenv("SCFT_MATILDA_REQUIRE_ANDERSON") != nullptr;
+    if (requireMixer && (stopAtNative || !requested || andersonDepth(requested) < 0)) {
+        throw std::runtime_error("Required Anderson controller has an unsupported request");
+    }
+    scftRaceStage("controller_begin", 0, box.densityEvaluations);
     auto mixer = stopAtNative ? nullptr : createAnderson(box, model);
+    std::cout << "Controller requested " << (requested ? requested : "auto") << " resolved "
+              << (mixer ? std::to_string(mixer->history) : "EMPC") << std::endl;
+    if (requireMixer && !mixer) {
+        throw std::runtime_error("Required Anderson controller did not resolve");
+    }
+    scftRaceStage("controller_ready", 0, box.densityEvaluations);
     const char* precisionMode = std::getenv("SCFT_MATILDA_FP32_BOND");
     const bool polish = precisionMode && std::string(precisionMode) == "polish" && !stopAtNative;
+    const char* forcePolish = std::getenv("SCFT_MATILDA_DIAGNOSTIC_FP64_AT");
+    const int forcedUpdate = forcePolish ? std::atoi(forcePolish) : 0;
+    if (forcePolish && (!polish || forcedUpdate < checkEvery || forcedUpdate > nsteps ||
+                        forcedUpdate % checkEvery || std::to_string(forcedUpdate) != forcePolish)) {
+        throw std::runtime_error("Diagnostic FP64 handover requires polish at a common check");
+    }
     int polishUpdate = 0;
     for (int step = 0; step < nsteps; ++step) {
         if (mixer) mixer->advance(step);
@@ -282,13 +317,16 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
                 throw std::runtime_error("The observer found nonfinite fields or an empty pore");
             }
             closure = std::sqrt(sums.pressure / box.M);
-            const bool startPolish = polish && !box.fullPrecisionBonds && closure <= 0.004;
+            const bool startPolish = polish && !box.fullPrecisionBonds &&
+                (forcePolish ? updates == forcedUpdate : closure <= 0.004);
             if (startPolish) {
+                scftRaceStage("fp64_begin", updates, box.densityEvaluations);
                 box.fullPrecisionBonds = true;
                 polishUpdate = updates;
                 passing = 0;
                 for (auto& species : box.Species) species.zeroDensity();
                 box.calcMoleculeDensities();
+                scftRaceStage("fp64_density_done", updates, box.densityEvaluations);
                 if (mixer) mixer->resetFromCurrentState();
                 sums = thrust::transform_reduce(thrust::device, first, first + box.M, perNode, Sums{}, AddSums{});
                 if (sums.invalid || sums.weight <= 0) throw std::runtime_error("Invalid FP64 polish state");
@@ -313,6 +351,10 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
                 sums.fieldImag << ',' << sums.densityImag << ',' << pass << '\n' << std::flush;
             lastA = a.d_density;
             lastB = b.d_density;
+            scftRaceStage(box.fullPrecisionBonds ? "fp64_check" : "initial_precision_check",
+                          updates, box.densityEvaluations);
+        } else {
+            scftRaceStage("update", updates, box.densityEvaluations);
         }
         if ((stopAtNative && native) || (!stopAtNative && converged)) break;
         ++box.totSteps;
@@ -320,8 +362,10 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     const auto result = cudaDeviceSynchronize();
     if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
     const double solveSeconds = secondsSince(solveStart);
+    scftRaceStage("host_copy_begin", updates, box.densityEvaluations);
     const thrust::host_vector<Complex> finalA = a.d_density, finalB = b.d_density;
     const double timeToFields = secondsSince(processStart);
+    scftRaceStage("fields_ready", updates, box.densityEvaluations);
     const auto exportStart = Clock::now();
     writeNpy(out / "phi_ps.npy", box, finalA, scale);
     writeNpy(out / "phi_pmma.npy", box, finalB, scale);
@@ -331,15 +375,17 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
     writeNpy(out / "w_pmma.npy", box, b.d_w, 1.0, true);
     if (particle) writeNpy(out / "np_fraction.npy", box, particle->d_density, scale);
     writePartitions(out / "fixed.json", box);
+    scftRaceStage("export_done", updates, box.densityEvaluations);
     auto meta = openOutput(out / "solver.json");
     meta << "{\n  \"revision\": \"" << MY_GIT_VERSION << "\",\n  \"converged\": " <<
-        (converged && updates % checkEvery == 0 ? "true" : "false") <<
+        (converged && !forcePolish && updates % checkEvery == 0 ? "true" : "false") <<
         ",\n  \"updates\": " << updates << ",\n  \"field_evals\": " <<
         box.densityEvaluations << ",\n  \"native_stop_update\": ";
     if (nativeStop) meta << nativeStop;
     else meta << "null";
     meta << ",\n  \"last_common_check_update\": " << updates / checkEvery * checkEvery <<
         ",\n  \"time_to_fields_s\": " << timeToFields <<
+        ",\n  \"diagnostic_fp64_switch\": " << (forcePolish ? "true" : "false") <<
         ",\n  \"solve_s\": " << solveSeconds <<
         ",\n  \"export_s\": " << secondsSince(exportStart);
     if (updates >= checkEvery && std::isfinite(closure + exchange + drift)) {
@@ -350,7 +396,10 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         meta << ",\n  \"anderson_history\": " << mixer->history
              << ",\n  \"anderson_mixed_steps\": " << mixer->mixedSteps
              << ",\n  \"anderson_rejections\": " << mixer->rejections
-             << ",\n  \"anderson_restarts\": " << mixer->restarts
+             << ",\n  \"anderson_restarts\": " << mixer->rankRestarts + mixer->rejections
+             << ",\n  \"anderson_rank_restarts\": " << mixer->rankRestarts
+             << ",\n  \"anderson_evictions\": " << mixer->evictions
+             << ",\n  \"anderson_precision_resets\": " << (polishUpdate ? 1 : 0)
              << ",\n  \"anderson_coefficient_clips\": " << mixer->clippedSteps;
     }
     if (polishUpdate) meta << ",\n  \"fp64_bond_from_update\": " << polishUpdate;
@@ -358,17 +407,36 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
 }
 }
 
+void scftRaceStage(const char* phase, int updates, int evaluations, std::size_t requestedBytes) {
+    static const char* directory = std::getenv("SCFT_RUN_DIR");
+    static const bool enabled = directory && std::getenv("SCFT_MATILDA_STAGES");
+    if (!enabled) return;
+    static auto trace = openOutput(Path(directory) / "stages.csv");
+    static const bool header = static_cast<bool>(trace <<
+        "phase,seconds,updates,evals,cuda_free_bytes,cuda_total_bytes,requested_bytes\n");
+    (void) header;
+    const double seconds = secondsSince(processStart);
+    std::size_t freeBytes = 0, totalBytes = 0;
+    cudaMemGetInfo(&freeBytes, &totalBytes);
+    trace << phase << ',' << seconds << ',' << updates << ',' << evaluations << ','
+          << freeBytes << ',' << totalBytes << ',' << requestedBytes << '\n' << std::flush;
+}
+
 void runScftRace(FTS_Box& box, int nsteps, const char* mode) {
     try {
         const char* output = std::getenv("SCFT_RUN_DIR");
         if (output == nullptr) throw std::runtime_error("Set SCFT_RUN_DIR to the guarded run");
-        const BinaryModel model(box);
         const std::string operation(mode);
+        if (operation == "mask") {
+            runMask(box, output);
+            return;
+        }
+        const BinaryModel model(box);
         if (operation == "fixed") runFixed(box, model, output);
         else if (operation == "observe" || operation == "native-observe") {
             runObserved(box, model, output, nsteps, operation == "native-observe");
         } else {
-            throw std::runtime_error("Select fixed, observe or native-observe");
+            throw std::runtime_error("Select fixed, mask, observe or native-observe");
         }
     } catch (const std::exception& error) {
         die(error.what());

@@ -1,4 +1,4 @@
-constexpr int maxMixHistory = 5;
+constexpr int maxMixHistory = 8;
 constexpr int mixThreads = 128;
 constexpr int mixPartials = 12;
 
@@ -82,7 +82,8 @@ struct AndersonMixer {
     int retained = 1;
     int mixedSteps = 0;
     int rejections = 0;
-    int restarts = 0;
+    int rankRestarts = 0;
+    int evictions = 0;
     int clippedSteps = 0;
     double norm = 0.0;
 
@@ -203,7 +204,7 @@ struct AndersonMixer {
             if (!coefficients(window)) {
                 window = damped;
                 retained = 1;
-                ++restarts;
+                ++rankRestarts;
             }
         }
         const int next = (head + 1) % slots;
@@ -211,7 +212,6 @@ struct AndersonMixer {
         double nextNorm = residualNorm(next);
         if (window.history && (!std::isfinite(nextNorm) || nextNorm > 1.35 * norm)) {
             ++rejections;
-            ++restarts;
             retained = 1;
             evaluate(damped, next);
             nextNorm = residualNorm(next);
@@ -220,17 +220,26 @@ struct AndersonMixer {
         }
         if (!std::isfinite(nextNorm)) throw std::runtime_error("Nonfinite damped mixing residual");
         norm = nextNorm;
+        if (history && retained == slots) ++evictions;
         retained = std::min(slots, retained + 1);
         head = next;
         if (step % box.logFreq == 0) box.writeData(step);
     }
 };
 
+int andersonDepth(std::string_view mode) {
+    if (mode == "damped") return 0;
+    int history = 0;
+    const auto result = std::from_chars(mode.data(), mode.data() + mode.size(), history);
+    if (result.ec != std::errc{} || result.ptr != mode.data() + mode.size() ||
+        history < 1 || history > maxMixHistory) return -1;
+    return history;
+}
+
 std::unique_ptr<AndersonMixer> createAnderson(FTS_Box& box, const BinaryModel& model) {
     const char* value = std::getenv("SCFT_MATILDA_ANDERSON");
     if (!value || !model.canonical || box.densityFieldFreq != 0 || box.chemFieldFreq != 0) return nullptr;
-    const std::string mode(value);
-    const int history = mode == "damped" ? 0 : mode == "3" ? 3 : mode == "5" ? 5 : -1;
+    const int history = andersonDepth(value);
     if (history < 0) return nullptr;
     PotentialIncompress* pressure = nullptr;
     PotentialFlory* flory = nullptr;

@@ -226,7 +226,9 @@ void FTS_Box::finishInitialization() {
     }
 
     // Calculate all density fields, including populating species densities
+    scftRaceStage("initial_density_begin");
     calcMoleculeDensities();
+    scftRaceStage("initial_density_done", 0, densityEvaluations);
     for ( int i=0 ; i<Molecs.size(); i++ ) {
         if ( Molecs[i]->molec_type != "HParticle" ) {
             outline += "Q[" + std::to_string(i) + "] ";
@@ -310,6 +312,7 @@ void FTS_Box::readInput(std::ifstream& inp) {
     rho0 = C = -1.0;
     boxStyle = "fts";
 
+    scftRaceStage("input_begin");
     // Some default values
     logFreq = 100;
     chemFieldFreq = 0;
@@ -449,10 +452,18 @@ void FTS_Box::readInput(std::ifstream& inp) {
     // After input read, make the FFT plan
     // This currently assumes complex-double to complex-double transforms
     // change Z2Z to C2C to switch to cpx-float
-    if ( this->Dim == 2 ) 
-        cufftPlan2d(&fftplan, Nx[1], Nx[0], CUFFT_Z2Z);
-    if ( this->Dim == 3 ) 
-        cufftPlan3d(&fftplan, Nx[2], Nx[1], Nx[0], CUFFT_Z2Z);
+    scftRaceStage("input_done");
+    auto fftStatus = Dim == 2
+        ? cufftPlan2d(&fftplan, Nx[1], Nx[0], CUFFT_Z2Z)
+        : cufftPlan3d(&fftplan, Nx[2], Nx[1], Nx[0], CUFFT_Z2Z);
+    if (fftStatus != CUFFT_SUCCESS) die("FTS box cuFFT plan creation failed");
+    if (std::getenv("SCFT_MATILDA_STAGES")) {
+        std::size_t workspaceBytes = 0;
+        if (cufftGetSize(fftplan, &workspaceBytes) != CUFFT_SUCCESS) {
+            die("FTS box cuFFT workspace query failed");
+        }
+        scftRaceStage("box_z2z_plan", 0, 0, workspaceBytes);
+    }
 
     // Define gvol, dx
     gvol = 1.0;
@@ -464,8 +475,11 @@ void FTS_Box::readInput(std::ifstream& inp) {
     M_Block = 512;
     M_Grid = (int)ceil((double)(M) / M_Block);
 
-    cudaMalloc(&d_cpxGabe, M*sizeof(cuDoubleComplex));
-    cudaMalloc(&d_cpxAtmn, M*sizeof(cuDoubleComplex));
+    const std::size_t fieldBytes = std::size_t(M) * sizeof(cuDoubleComplex);
+    for (auto** scratch : {&d_cpxGabe, &d_cpxAtmn}) {
+        scftRaceStage("box_scratch_allocate", 0, 0, fieldBytes);
+        if (cudaMalloc(scratch, fieldBytes) != cudaSuccess) die("FTS box scratch allocation failed");
+    }
 
     if ( rho0 > 0 && C > 0 ) { die("Cannot define both C and rho0!"); }
 
@@ -485,6 +499,7 @@ void FTS_Box::readInput(std::ifstream& inp) {
     simTime = time(0);
     ftTimer = speciesTimer = moleculeTimer = fieldUpdateTimer = 0;
 
+    scftRaceStage("linear_terms_begin");
     // Initialize linear coeffs
     for ( int i=0 ; i<Potentials.size(); i++ ) {
         Potentials[i]->initLinearCoeffs();
@@ -495,6 +510,7 @@ void FTS_Box::readInput(std::ifstream& inp) {
         Molecs[i]->computeLinearTerms();
     }
 
+    scftRaceStage("linear_terms_done");
     finishInitialization();
 }
 
