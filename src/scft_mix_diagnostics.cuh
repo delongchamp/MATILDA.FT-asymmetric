@@ -126,7 +126,7 @@ public:
             return updates >= range.first && updates <= range.second;
         });
         if (!inWindow) return;
-        const int restarts = mixer.rejections + mixer.rankRestarts + mixer.explicitResets;
+        const int restarts = mixer.rejections + mixer.rankRestarts + mixer.explicitResets + mixer.corrections;
         const bool fp64 = mixer.box.fullPrecisionBonds;
         if (updates != previousUpdate + 1 || fp64 != previousPrecision || restarts != previousRestarts) count = 0;
         previousUpdate = updates;

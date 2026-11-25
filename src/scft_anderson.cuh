@@ -4,7 +4,15 @@ constexpr int mixPartials = 12;
 constexpr int parallelNormPartials = 96;
 
 enum class GramLayout { Square, Ordered, Extend };
-enum class MixTrial { Parent, Reset, Period2, Period4, RidgeFixed, RidgeAdaptive };
+enum class MixTrial { Parent, Reset, Period2, Period4, RidgeFixed, RidgeAdaptive, Rpm1, Rpm2,
+                      BlockDiag, Block2, Block4 };
+
+struct AndersonMixer;
+struct MixWindow;
+struct MixIntervention {
+    virtual bool attempt(AndersonMixer& mixer, MixWindow window, int update, int next) = 0;
+    virtual ~MixIntervention() = default;
+};
 
 MixTrial requestedTrial() {
     const char* option = std::getenv("SCFT_MATILDA_MIX_TRIAL");
@@ -15,6 +23,11 @@ MixTrial requestedTrial() {
     if (name == "period4") return MixTrial::Period4;
     if (name == "ridge_fixed") return MixTrial::RidgeFixed;
     if (name == "ridge_adapt") return MixTrial::RidgeAdaptive;
+    if (name == "rpm1") return MixTrial::Rpm1;
+    if (name == "rpm2") return MixTrial::Rpm2;
+    if (name == "block_diag") return MixTrial::BlockDiag;
+    if (name == "block2") return MixTrial::Block2;
+    if (name == "block4") return MixTrial::Block4;
     throw std::runtime_error("Unsupported Anderson experiment: " + std::string(name));
 }
 
@@ -201,6 +214,7 @@ struct AndersonMixer {
     int fitAttempts = 0;
     int explicitResets = 0;
     int skippedFits = 0;
+    int corrections = 0;
     RidgeAgreement agreement;
     std::ofstream trialTrace;
     double norm = 0.0;
@@ -218,7 +232,7 @@ struct AndersonMixer {
             trialTrace = openOutput(Path(std::getenv("SCFT_RUN_DIR")) / "mix-trial.csv");
             trialTrace << "updates,evals,fp64,eligible,fit_attempted,fit_accepted,raw_rejected,"
                           "scheduled_reset,rank_reset,lambda,next_lambda,prediction,actual,"
-                          "raw_norm,fitted_norm,coefficient_s,fit_norm_s\n";
+                          "raw_norm,fitted_norm,coefficient_s,fit_norm_s,subspace_accepted\n";
         }
         resetFromCurrentState();
     }
@@ -339,18 +353,26 @@ struct AndersonMixer {
         }
     }
 
-    double residualNorm(int slot) {
+    double residualNorm(int slot, const Complex* values = nullptr) {
         double square = 0.0;
+        const bool scratchState = values != nullptr;
+        if (!values) values = thrust::raw_pointer_cast(r.data());
         const MixWindow window{0, {slot}, {}};
         if (parallelNorm) {
             std::array<double, parallelNormPartials> host{};
             auto* scratch = thrust::raw_pointer_cast(partials.data());
             mixGram<GramLayout::Ordered><<<dim3(1, parallelNormPartials), mixThreads>>>(
-                thrust::raw_pointer_cast(r.data()), box.M, window, scratch);
+                values, box.M, window, scratch);
             checkMixCuda(cudaMemcpy(host.data(), scratch, sizeof(host), cudaMemcpyDeviceToHost));
             for (double part : host) square += part;
-        } else {
+        } else if (!scratchState) {
             gram(window, &square);
+        } else {
+            std::array<double, mixPartials> host{};
+            auto* scratch = thrust::raw_pointer_cast(partials.data());
+            mixGram<GramLayout::Ordered><<<dim3(1, mixPartials), mixThreads>>>(values, box.M, window, scratch);
+            checkMixCuda(cudaMemcpy(host.data(), scratch, sizeof(host), cudaMemcpyDeviceToHost));
+            for (double part : host) square += part;
         }
         return std::sqrt(square);
     }
@@ -417,7 +439,7 @@ struct AndersonMixer {
         capture(next);
     }
 
-    void advance(int step) {
+    void advance(int step, MixIntervention* intervention) {
         const int slots = history + 1;
         const MixWindow damped{0, {head}, {}};
         auto window = damped;
@@ -453,10 +475,14 @@ struct AndersonMixer {
             cachedWindow.history = 0;
         }
         const int next = (head + 1) % slots;
-        evaluate(window, next);
+        const bool corrected = intervention && intervention->attempt(*this, window, step + 1, next);
+        if (!corrected) evaluate(window, next);
         double nextNorm = residualNorm(next);
-        const bool rejected = window.history && (!std::isfinite(nextNorm) || nextNorm > 1.35 * norm);
-        if (rejected) {
+        const bool rejected = !corrected && window.history && (!std::isfinite(nextNorm) || nextNorm > 1.35 * norm);
+        if (corrected) {
+            ++corrections;
+            cachedWindow.history = 0;
+        } else if (rejected) {
             ++rejections;
             retained = 1;
             cachedWindow.history = 0;
@@ -480,7 +506,7 @@ struct AndersonMixer {
         }
         if (trialTrace.is_open()) {
             trialTrace << step + 1 << ',' << box.densityEvaluations << ',' << box.fullPrecisionBonds << ','
-                       << eligible << ',' << fit << ',' << (window.history && !rejected) << ',' << rejected << ','
+                       << eligible << ',' << fit << ',' << (window.history && !rejected && !corrected) << ',' << rejected << ','
                        << scheduledReset << ',' << rankReset << ',';
             if (ridgeEnabled) {
                 trialTrace << lambda << ',' << agreement.lambda << ',';
@@ -495,11 +521,11 @@ struct AndersonMixer {
             }
             trialTrace << ',' << nextNorm << ',';
             if (ridgeEnabled) trialTrace << std::sqrt(agreement.currentSquare);
-            trialTrace << ',' << coefficientSeconds << ',' << normSeconds << '\n' << std::flush;
+            trialTrace << ',' << coefficientSeconds << ',' << normSeconds << ',' << corrected << '\n' << std::flush;
         }
         norm = nextNorm;
         if (history && retained == slots) ++evictions;
-        retained = std::min(slots, retained + 1);
+        retained = corrected ? 1 : std::min(slots, retained + 1);
         head = next;
         if (step % box.logFreq == 0) box.writeData(step);
     }

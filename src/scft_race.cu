@@ -203,6 +203,7 @@ const Complex* deviceData(const DeviceField& field) {
 }
 
 #include "scft_mix_diagnostics.cuh"
+#include "scft_subspace.cuh"
 
 void writePartitions(const Path& path, const FTS_Box& box) {
     auto out = openOutput(path);
@@ -309,9 +310,13 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         if (!mixer || mixer->history < 2) throw std::runtime_error("Lag windows require at least two differences");
         lagTrace = std::make_unique<MixLagTrace>(out, box.M, windows);
     }
+    std::unique_ptr<SubspaceExperiment> subspace;
+    if (mixer && mixer->trial >= MixTrial::Rpm1) {
+        subspace = std::make_unique<SubspaceExperiment>(model, *mixer, out);
+    }
     int polishUpdate = 0;
     for (int step = 0; step < nsteps; ++step) {
-        if (mixer) mixer->advance(step);
+        if (mixer) mixer->advance(step, subspace.get());
         else box.doTimeStep(step);
         ++updates;
         const bool native = step >= 50 && !nativeStop && box.converged(step);
@@ -427,7 +432,8 @@ void runObserved(FTS_Box& box, const BinaryModel& model, const Path& out, int ns
         if (mixer->trial != MixTrial::Parent) {
             meta << ",\n  \"anderson_fit_attempts\": " << mixer->fitAttempts
                  << ",\n  \"anderson_skipped_fits\": " << mixer->skippedFits
-                 << ",\n  \"anderson_scheduled_resets\": " << mixer->explicitResets;
+                 << ",\n  \"anderson_scheduled_resets\": " << mixer->explicitResets
+                 << ",\n  \"anderson_subspace_corrections\": " << mixer->corrections;
         }
     }
     if (polishUpdate) meta << ",\n  \"fp64_bond_from_update\": " << polishUpdate;
